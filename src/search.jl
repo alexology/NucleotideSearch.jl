@@ -70,10 +70,11 @@ struct _SearchSettings
     minwordmatches::Int
     scoring::_Scoring
     cigar::Bool
+    max_postings::Int       # k-mers in more targets are not counted (`search` only)
 end
 
 function _settings(mode, min_identity, iddef, query_cov, maxhits, maxaccepts, maxrejects,
-                   minwordmatches, scoring::Scoring, cigar)
+                   minwordmatches, scoring::Scoring, cigar; max_postings::Int = typemax(Int))
     0 <= min_identity <= 100 ||
         throw(ArgumentError("min_identity must be a percentage between 0 and 100"))
     0 < min_identity <= 1 &&
@@ -84,7 +85,7 @@ function _settings(mode, min_identity, iddef, query_cov, maxhits, maxaccepts, ma
         throw(ArgumentError("maxhits, maxaccepts, maxrejects and minwordmatches must be >= 0"))
     _SearchSettings(mode, min_identity / 100, Float64(min_identity) - 1e-9, iddef, query_cov,
                     maxhits, maxaccepts, maxrejects, minwordmatches,
-                    _kernel_scoring(scoring, mode), cigar)
+                    _kernel_scoring(scoring, mode), cigar, max_postings)
 end
 
 # Diagonal band for sequences of lengths `la` and `lb`. Under iddef 1/4 an
@@ -115,13 +116,13 @@ struct _SearchState
     shared::Vector{Int32}    # shared unique k-mers with the current query
     touched::Vector{Int}
     candidates::Vector{Int}
-    qkp::Vector{UInt32}      # k-mers occurring once in the query, sorted,
-    qpos::Vector{Int32}      # with their end positions
+    qkp::NTuple{2,Vector{UInt32}}  # per strand: k-mers occurring once in the query,
+    qpos::NTuple{2,Vector{Int32}}  # sorted, with their end positions
     diags::Vector{Int}
 end
 
-_SearchState(n::Int) = _SearchState(_Workspace(), zeros(Int32, n), Int[], Int[], UInt32[],
-                                    Int32[], Int[])
+_SearchState(n::Int) = _SearchState(_Workspace(), zeros(Int32, n), Int[], Int[],
+                                    (UInt32[], UInt32[]), (Int32[], Int32[]), Int[])
 
 # Targets sharing enough unique k-mers (`qkmers`) with the query, by decreasing
 # number of shared k-mers (ties: index).
@@ -307,8 +308,8 @@ end
 
 # Most frequent diagonal (target position - query position) among the k-mers
 # that occur once in the query and appear in the target; `nothing` if none.
-function _seed_diagonal(st::_SearchState, t::AbstractVector{UInt8}, k::Int)
-    kp = st.qkp; pos = st.qpos
+function _seed_diagonal(st::_SearchState, si::Int, t::AbstractVector{UInt8}, k::Int)
+    kp = st.qkp[si]; pos = st.qpos[si]
     isempty(kp) && return nothing
     diags = empty!(st.diags)
     mask = (UInt32(1) << (2k)) - UInt32(1)
@@ -343,12 +344,12 @@ end
 # target around the seed diagonal. The result is recomputed on the whole target
 # without band if the path touches the band edge or a window boundary inside
 # the target. Coordinates refer to the whole target.
-function _query_stats(st::_SearchState, a::AbstractVector{UInt8}, b::AbstractVector{UInt8},
+function _query_stats(st::_SearchState, si::Int, a::AbstractVector{UInt8}, b::AbstractVector{UInt8},
                       k::Int, s::_SearchSettings)
     la = length(a); lb = length(b)
     t = s.min_identity
     slack = t > 0 ? min(la + lb, floor(Int, (1 - t) / t * la)) : la + lb
-    d = _seed_diagonal(st, b, k)
+    d = _seed_diagonal(st, si, b, k)
     if d !== nothing
         margin = slack + 16
         lo = max(1, d + 1 - margin); hi = min(lb, d + la + margin)
@@ -370,9 +371,9 @@ function _query_stats(st::_SearchState, a::AbstractVector{UInt8}, b::AbstractVec
     _align(st.ws, a, b, -la, lb, s.scoring)
 end
 
-function _target_stats(st::_SearchState, a, b, k::Int, s::_SearchSettings)
+function _target_stats(st::_SearchState, si::Int, a, b, k::Int, s::_SearchSettings)
     if s.mode === :query
-        _query_stats(st, a, b, k, s)
+        _query_stats(st, si, a, b, k, s)
     else
         la = length(a); lb = length(b)
         klo, khi = _band(la, lb, s)
@@ -393,43 +394,66 @@ function _search_query(st::_SearchState, q::Int, query::Vector{UInt8}, db::Seque
     cands = Tuple{Int32,Int,Int}[]   # (-shared, target, strand index)
     for (si, a) in enumerate(oriented)
         _collect_candidates!(cands, st, _unique_kmers(a, k), db, s, si)
+        s.mode === :query && _kmer_positions!(st.qkp[si], st.qpos[si], a, k)
     end
-    sort!(cands)
     accepted = Hit[]
     rejected = 0
-    current = 0
-    for (_, tg, si) in cands
-        b = _seq(db, tg)
-        lb = length(b)
-        a = oriented[si]
-        ok = false
-        if _length_compatible(la, lb, s)
-            if s.mode === :query && si != current
-                _kmer_positions!(st.qkp, st.qpos, a, k); current = si
+    # The candidates are ordered in blocks (partial sort): usually only the
+    # first few hundred are aligned before `maxaccepts`/`maxrejects` stop the
+    # search, out of up to all references. The order is the full sort order.
+    n = length(cands); lo = 1; done = false
+    while lo <= n && !done
+        hi = min(n, lo + 255)
+        partialsort!(view(cands, lo:n), 1:(hi - lo + 1))
+        for c in lo:hi
+            _, tg, si = cands[c]
+            b = _seq(db, tg)
+            lb = length(b)
+            a = oriented[si]
+            ok = false
+            if _length_compatible(la, lb, s)
+                r = _target_stats(st, si, a, b, k, s)
+                id = _identity(r, la, lb, s.iddef)
+                ok = r.aend > 0 && id >= s.id_threshold &&
+                     r.matches + r.mismatches >= s.query_cov * la
+                # The workspace still holds the path of `r`.
+                ok && push!(accepted, _hit(q, tg, strands[si], id, r, la,
+                                           s.cigar ? _cigar(st.ws.ops, r, la) : ""))
             end
-            r = _target_stats(st, a, b, k, s)
-            id = _identity(r, la, lb, s.iddef)
-            ok = r.aend > 0 && id >= s.id_threshold && r.matches + r.mismatches >= s.query_cov * la
-            # The workspace still holds the path of `r`.
-            ok && push!(accepted, _hit(q, tg, strands[si], id, r, la,
-                                       s.cigar ? _cigar(st.ws.ops, r, la) : ""))
+            if ok
+                s.maxaccepts > 0 && length(accepted) >= s.maxaccepts && (done = true; break)
+            else
+                rejected += 1
+                s.maxrejects > 0 && rejected >= s.maxrejects && (done = true; break)
+            end
         end
-        if ok
-            s.maxaccepts > 0 && length(accepted) >= s.maxaccepts && break
-        else
-            rejected += 1
-            s.maxrejects > 0 && rejected >= s.maxrejects && break
-        end
+        lo = hi + 1
     end
     _finish!(accepted, s)
 end
 
+# K-mers in more than this many targets are not counted: a fraction of the
+# database, but never fewer than 50,000 targets. On databases of 5,000-10,000
+# references a cap made the best hits worse (fewer good candidates) for little
+# speed; on SILVA (313,502 references) a cap of 0.2 halved the search time
+# with the same results.
+function _max_postings(frac::Real, n::Int)
+    0 < frac <= 1 || throw(ArgumentError("max_kmer_frequency must be in (0, 1]"))
+    frac == 1 ? typemax(Int) : max(50_000, floor(Int, frac * n))
+end
+
 # Appends (-shared k-mers, target, `si`) for the targets sharing enough of the
-# query k-mers `qk` (all targets if the threshold is 0).
+# query k-mers `qk` (all targets if the threshold is 0). K-mers found in more
+# than `s.max_postings` targets are not counted, unless fewer than
+# `minwordmatches` query k-mers would remain.
 function _collect_candidates!(cands, st::_SearchState, qk::Vector{UInt32}, db::SequenceDB,
                               s::_SearchSettings, si::Int)
     shared = st.shared; touched = empty!(st.touched)
     offsets = db.offsets; postings = db.postings
+    if s.max_postings < length(postings)
+        rare = filter(w -> offsets[w+2] - offsets[w+1] <= s.max_postings, qk)
+        length(rare) >= s.minwordmatches && (qk = rare)
+    end
     for w in qk, p in (offsets[w+1]+1):offsets[w+2]
         tg = postings[p]
         shared[tg] == 0 && push!(touched, tg)
@@ -455,7 +479,8 @@ end
     search(queries, db::SequenceDB; mode = :query, strand = :both,
            min_identity = 80, iddef = 2, query_cov = 0.9, maxhits = 10,
            maxaccepts = 10, maxrejects = 32, minwordmatches = 12,
-           scoring = <mode default>, cigar = false) -> Vector{Vector{Hit}}
+           scoring = <mode default>, cigar = false, max_kmer_frequency = 1)
+        -> Vector{Vector{Hit}}
 
 Search each query (strings or encoded vectors) against the database; element
 `q` of the result holds the [`Hit`](@ref)s of query `q`, sorted by
@@ -481,12 +506,20 @@ Candidate selection, acceptance (`min_identity`, `query_cov`), `maxaccepts`,
 `maxrejects`, `maxhits` and `iddef` are as in [`search_self`](@ref); `iddef =
 2` (default here) ignores the unaligned ends of the target. Candidates of both
 strands are ranked together. `cigar = true` adds the CIGAR string of each hit.
+
+`max_kmer_frequency < 1` skips, when counting shared k-mers, the k-mers found
+in more than that fraction of the references and in more than 50,000 of
+them (conserved regions of large databases, which make every reference a
+candidate and dominate the search time); if fewer than `minwordmatches`
+query k-mers remain, all are used. On SILVA (313,502 16S references)
+`max_kmer_frequency = 0.2` halved the search time with the same hits.
 """
 function search(queries::AbstractVector, db::SequenceDB; mode::Symbol = :query,
                 strand::Symbol = :both, min_identity::Real = 80, iddef::Integer = 2,
                 query_cov::Real = 0.9, maxhits::Integer = 10, maxaccepts::Integer = 10,
                 maxrejects::Integer = 32, minwordmatches::Integer = 12,
-                scoring::Scoring = _default_scoring(_check_mode(mode)), cigar::Bool = false)
+                scoring::Scoring = _default_scoring(_check_mode(mode)), cigar::Bool = false,
+                max_kmer_frequency::Real = 1.0)
     _check_mode(mode)
     strand in (:both, :plus) || throw(ArgumentError("strand must be :both or :plus"))
     # Columns and gap openings that include end gaps depend on the target window
@@ -495,7 +528,8 @@ function search(queries::AbstractVector, db::SequenceDB; mode::Symbol = :query,
         throw(ArgumentError("in :query mode iddef must be 0 or 2"))
     strands = strand === :both ? ('+', '-') : ('+',)
     s = _settings(mode, min_identity, iddef, query_cov, maxhits, maxaccepts, maxrejects,
-                  minwordmatches, scoring, cigar)
+                  minwordmatches, scoring, cigar;
+                  max_postings = _max_postings(max_kmer_frequency, nsequences(db)))
     encoded = [collect(encode(x)) for x in queries]
     n = length(encoded)
     results = Vector{Vector{Hit}}(undef, n)

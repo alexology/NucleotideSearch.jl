@@ -310,6 +310,10 @@ end
         full = align(a, refs[t]; mode = :query)
         @test best.score == full.score
     end
+    # On small databases the k-mer frequency cap (>= 50,000 targets) changes nothing.
+    @test search(queries, db; max_kmer_frequency = 0.2) == search(queries, db)
+    @test_throws ArgumentError search(queries, db; max_kmer_frequency = 0)
+    @test_throws ArgumentError search(queries, db; max_kmer_frequency = 1.5)
     @test_throws ArgumentError search(queries, db; iddef = 1)
     @test_throws ArgumentError search(queries, db; strand = :minus)
     @test length(search(queries[1:2], db; mode = :global, iddef = 1, min_identity = 10,
@@ -318,6 +322,39 @@ end
           h -> all(x -> x.strand == '+', h)
     # One query given as a string.
     @test search(decode(queries[1]), db; cigar = true) == hits[1]
+end
+
+@testset "search: frequent k-mers are not counted" begin
+    # A 40-base block shared by all targets; target 3 also shares the query's
+    # unique part. With the cap, only the unique part counts.
+    rng = MersenneTwister(8)
+    block = randseq(rng, 40)
+    uniq = randseq(rng, 60)
+    targets = [vcat(block, randseq(rng, 60)), vcat(block, randseq(rng, 60)), vcat(block, uniq)]
+    db = SequenceDB(["t1", "t2", "t3"], targets)
+    q = vcat(block, uniq)
+    st = NucleotideSearch._SearchState(3)
+    count_cands(maxp, mww) = begin
+        s = NucleotideSearch._settings(:query, 80, 2, 0.5, 0, 10, 32, mww,
+                                       NucleotideSearch._default_scoring(:query), false;
+                                       max_postings = maxp)
+        c = Tuple{Int32,Int,Int}[]
+        NucleotideSearch._collect_candidates!(c, st, NucleotideSearch._unique_kmers(q, 8), db, s, 1)
+        sort!(c)
+    end
+    all3 = count_cands(typemax(Int), 12)
+    @test [x[2] for x in all3] == [3, 1, 2]          # all share the block
+    capped = count_cands(1, 12)                       # k-mers in > 1 target skipped
+    @test [x[2] for x in capped] == [3]
+    # Only the block k-mers are skipped (k-mers across the junction are rare too).
+    @test -capped[1][1] == length(NucleotideSearch._unique_kmers(q, 8)) -
+                           length(NucleotideSearch._unique_kmers(block, 8))
+    # Too few rare k-mers: all are used, as without cap.
+    @test count_cands(1, 200) == count_cands(typemax(Int), 200)
+    @test -count_cands(1, 200)[1][1] == length(NucleotideSearch._unique_kmers(q, 8))
+    @test NucleotideSearch._max_postings(0.2, 10_000) == 50_000
+    @test NucleotideSearch._max_postings(0.2, 1_000_000) == 200_000
+    @test NucleotideSearch._max_postings(1.0, 10) == typemax(Int)
 end
 
 @testset "search: indels and window fallback" begin

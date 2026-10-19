@@ -116,8 +116,18 @@ Notes:
   | 300,000 | 9.5 s | 1.0 GB | 0.5 s | 2.3 s (`maxaccepts = 10`), 6.1 s (100) |
 
   Memory grows linearly: about 3.3 GB per million 650-bp references, more
-  with longer ones. k-mer sampling (minimizers), which would reduce it, is
-  not implemented.
+  with longer ones. On SILVA v132 (313,502 near full-length 16S, 461 Mbp)
+  the index takes 2.4 GB (file 2.3 GB, built in 28 s, loaded in 2 s; peak
+  memory 4.9 GB while building). k-mer sampling (minimizers), which would
+  reduce memory, is not implemented.
+- In large databases with conserved regions (16S: 550 k-mers occur in more
+  than half of SILVA, one in 99.7%) every reference becomes a candidate and
+  counting shared k-mers dominates the time. `max_kmer_frequency = 0.2`
+  skips k-mers found in more than 20% of the references (and in more than
+  50,000): on SILVA this halved the search time with the same hits, while
+  on databases of 5,000–10,000 references a cap made hits worse, hence the
+  50,000 floor. The default of `search` is no cap (`1`); ASVCoordinates.jl
+  uses 0.2. Candidates are also ordered by partial sorting, in blocks.
 - Bases other than A, C, G, T/U (`N`, IUPAC codes) never match, also in the
   references: an ambiguity code in a reference counts as a mismatch.
 
