@@ -14,7 +14,9 @@ at the ends of the target (unaligned query bases). The defaults are those of
 VSEARCH.
 
 In `:query` mode the query end gaps are always free, whatever the values
-given here.
+given here, and the target end gap penalties also price soft clipping: an
+unaligned end of the query costs `target_end_gap_open + n *
+target_end_gap_extend` whether or not the target continues.
 """
 struct Scoring
     match::Int
@@ -48,11 +50,10 @@ Scoring(; match::Integer = 2, mismatch::Integer = -4, gap_open::Integer = 20,
     Scoring(match, mismatch, gap_open, gap_extend, query_end_gap_open, query_end_gap_extend,
             target_end_gap_open, target_end_gap_extend)
 
-# Default scoring of each mode. In `:query` mode unaligned query bases at the
-# ends (target too short, or ends that do not match it) cost almost as much as
-# an internal gap (open 20, extend 1 instead of 2): the ends of the query are
-# clipped only after about 8 consecutive mismatching bases, and an overhang
-# beyond the end of the target is an end gap rather than an internal gap.
+# Default scoring of each mode. In `:query` mode unaligned query bases
+# (clipped ends, inside or beyond the target) cost 20 + n: an end is clipped
+# after about 7 consecutive mismatches (about 14 unrelated bases), and an
+# overhang is never turned into an internal gap (20 + 2n).
 _default_scoring(mode::Symbol) =
     mode === :query ? Scoring(terminal_gap_open = 20, terminal_gap_extend = 1) : Scoring()
 
@@ -61,11 +62,17 @@ function _check_mode(mode::Symbol)
     mode
 end
 
-# Kernel scoring with the query as `a` (rows) and the target as `b`.
+# Kernel scoring with the query as `a` (rows) and the target as `b`. In
+# `:query` mode the query ends may also be left unaligned inside the target
+# (soft clipping), at the cost of target end gaps: an unaligned query end
+# costs the same whether or not the target continues.
 _kernel_scoring(sc::Scoring, mode::Symbol) =
+    mode === :query ?
+    _Scoring(sc.match, sc.mismatch, sc.gap_open, sc.gap_extend, 0, 0,
+             sc.target_end_gap_open, sc.target_end_gap_extend,
+             sc.target_end_gap_open, sc.target_end_gap_extend) :
     _Scoring(sc.match, sc.mismatch, sc.gap_open, sc.gap_extend,
-             mode === :query ? 0 : sc.query_end_gap_open,
-             mode === :query ? 0 : sc.query_end_gap_extend,
+             sc.query_end_gap_open, sc.query_end_gap_extend,
              sc.target_end_gap_open, sc.target_end_gap_extend)
 
 """

@@ -465,10 +465,12 @@ decreasing identity.
   at the ends of the query (unaligned target bases) are free, so target
   coordinates are exact start and end positions of the query on the
   reference, also with mismatches or indels near the ends. In the default
-  scoring unaligned query bases at the ends cost almost as much as an
-  internal gap (`terminal_gap_open = 20`, `terminal_gap_extend = 1`), so the
-  query ends are clipped only after about 8 consecutive mismatching bases
-  (or where the target ends). The alignment is computed in a window
+  scoring unaligned query bases beyond an end of the target cost
+  `terminal_gap_open = 20` + `terminal_gap_extend = 1` per base, and so does
+  a query end left unaligned inside the target (soft clipping): an end is
+  clipped after about 7 consecutive mismatches (about 14 unrelated bases),
+  so a divergent end does not distort the coordinates of the rest. Only
+  `iddef` 0 and 2 are allowed. The alignment is computed in a window
   of the target around the most frequent k-mer diagonal and recomputed on the
   whole target if it reaches the window or band boundaries.
 - `mode = :global`: end-to-end alignment as in [`search_self`](@ref).
@@ -487,6 +489,10 @@ function search(queries::AbstractVector, db::SequenceDB; mode::Symbol = :query,
                 scoring::Scoring = _default_scoring(_check_mode(mode)), cigar::Bool = false)
     _check_mode(mode)
     strand in (:both, :plus) || throw(ArgumentError("strand must be :both or :plus"))
+    # Columns and gap openings that include end gaps depend on the target window
+    # in `:query` mode, so only iddef 0 and 2 are meaningful there.
+    mode === :query && !(iddef in (0, 2)) &&
+        throw(ArgumentError("in :query mode iddef must be 0 or 2"))
     strands = strand === :both ? ('+', '-') : ('+',)
     s = _settings(mode, min_identity, iddef, query_cov, maxhits, maxaccepts, maxrejects,
                   minwordmatches, scoring, cigar)

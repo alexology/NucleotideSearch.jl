@@ -80,10 +80,15 @@ A, C, G, T/U never match.
 `Scoring` sets match, mismatch and gap penalties (a gap of length `n` costs
 `open + n * extend`) and separate penalties for end gaps of the query and of
 the target. Defaults: match 2, mismatch −4, gap 20 + 2n, end gaps 2 + n (the
-VSEARCH defaults). In `:query` mode the query end gaps are free and, by
-default, unaligned query bases cost 20 + n: an end of the query is left
-unaligned only after about 8 consecutive mismatching bases or where the
-reference ends.
+VSEARCH defaults). In `:query` mode the query end gaps are free and the
+query ends are **soft-clipped**: an end of the query may be left unaligned,
+whether the reference ends there or continues, at a cost of 20 + n by
+default (the target end gap penalties). An end is therefore clipped only
+after about 7 consecutive mismatches (or about 14 unrelated bases), and a
+divergent end (primer remnant, chimera, non-homologous tail) does not distort
+the coordinates of the rest. `:global` mode never clips. Only `iddef` 0 and
+2 are allowed in `:query` mode (the others count end gaps, which depend on
+the window).
 
 In `:query` mode each candidate is aligned in a window of the reference
 around the most frequent k-mer diagonal, with a band wide enough for
@@ -101,16 +106,28 @@ Notes:
   score better than opening a gap (gap open 20): an indel within the first
   or last few bases may move the coordinate by that much. This is a property
   of any affine-gap alignment, not of the band.
-- The index takes 4 bytes per unique k-mer of each reference (30 MB for the
-  5,417 rbcL references below). Very large databases (10⁶ references) need
-  several GB; k-mer sampling is not implemented yet.
+- The index takes 4 bytes per unique k-mer of each reference plus the
+  sequences (1 byte per base). Measured on synthetic databases of homologous
+  650-bp references (100 variants per species, 1–8% divergence), 4 threads:
+
+  | References | Build | Index in memory / file | Load | 500 queries (420 bp) |
+  |---|---|---|---|---|
+  | 100,000 | 3.3 s | 0.34 GB | 0.2 s | 1.0 s (`maxaccepts = 10`), 4.9 s (100) |
+  | 300,000 | 9.5 s | 1.0 GB | 0.5 s | 2.3 s (`maxaccepts = 10`), 6.1 s (100) |
+
+  Memory grows linearly: about 3.3 GB per million 650-bp references, more
+  with longer ones. k-mer sampling (minimizers), which would reduce it, is
+  not implemented.
+- Bases other than A, C, G, T/U (`N`, IUPAC codes) never match, also in the
+  references: an ambiguity code in a reference counts as a mismatch.
 
 ## Validation
 
 - `test/runtests.jl` (`julia -t 4 --project=. -e 'using Pkg; Pkg.test()'`,
   about 3,300 tests, 20 s): the kernel against a full-matrix reference
-  dynamic programming with random scores, end-gap penalties and both score
-  widths, including the traceback score; coordinates and CIGAR strings on
+  dynamic programming with random scores, end-gap penalties, soft clipping
+  and both score widths, including the score of the traced path;
+  coordinates and CIGAR strings on
   synthetic references with mutated query ends, indels, both strands and
   truncated references; windowed search against unbanded alignment;
   database save/load; `search_self`.
@@ -125,14 +142,18 @@ Notes:
   | best BLAST hits with clipped query ends | 26 | 20 |
   | NucleotideSearch target coordinates equal to BLAST's, after extending BLAST's by the clipped query bases | 297 / 303 | 295 / 303 |
 
-  Five of the remaining cases are references that start after the ASV start:
-  both programs give the same coordinates, with the overhang as a soft clip
-  (`41S290M`). One is an ambiguous end one base before the end of the
-  reference. `search` of the 303 ASVs against the 5,417 references took
-  0.5 s on 4 threads (database built in 0.4 s; loaded in 0.1 s).
+  The remaining cases are references that end inside the ASV: both programs
+  give the same coordinates, with the overhang as a soft clip (`41S290M`,
+  `326M5S`), except one ASV whose last bases, 3 bases from the end of the
+  reference, are ambiguous (BLAST aligns 7 more bases with a gap;
+  NucleotideSearch clips 11). `search` of the 303 ASVs against the 5,417
+  references took 0.6 s on 4 threads (database built in 0.3 s; loaded in
+  0.1 s). See ASVCoordinates.jl for a second data set (COI).
 
 ## Origin
 
 The k-mer prefilter and the anti-diagonal kernel come from `build_matchlist`
 of LULU.jl (2026), generalised with separate end-gap penalties per sequence,
-coordinates, CIGAR strings, a persistent index and the `:query` mode.
+coordinates, CIGAR strings, a persistent index and the `:query` mode with
+soft clipping (a third, vertical gap state for the clipped end, so that the
+kernel stays vectorised: 1.6 times the cost of the plain kernel).

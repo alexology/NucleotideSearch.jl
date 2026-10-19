@@ -15,6 +15,13 @@
 # Sequence `a` indexes the rows (`i`), `b` the columns (`j`). Horizontal gaps
 # (gap symbols in `a`, consuming `b`) in the first or last row are end gaps of
 # `a`; vertical gaps in the first or last column are end gaps of `b`.
+#
+# With `clip_open >= 0` (soft clipping) the first `i` bases of `a` may be left
+# unaligned (the path starts at any cell of row `i`), and so may the last
+# ones, at a cost of `clip_open + n * clip_extend` per clipped end. The end
+# clip is a third vertical gap state G that can only return to H in the last
+# row, from which the end gaps of `a` (free when `a` is fitted into `b`) lead
+# to `(la, lb)`. Bases of `b` outside the path cost the end gaps of `a`.
 struct _Scoring
     match::Int32
     mismatch::Int32
@@ -24,7 +31,16 @@ struct _Scoring
     a_end_extend::Int32
     b_end_open::Int32
     b_end_extend::Int32
+    clip_open::Int32
+    clip_extend::Int32
 end
+
+_Scoring(match, mismatch, gap_open, gap_extend, a_end_open, a_end_extend, b_end_open,
+         b_end_extend) =
+    _Scoring(match, mismatch, gap_open, gap_extend, a_end_open, a_end_extend, b_end_open,
+             b_end_extend, -1, -1)
+
+_clipping(sc::_Scoring) = sc.clip_open >= 0
 
 struct _AlignStats
     score::Int
@@ -41,18 +57,18 @@ struct _AlignStats
     bend::Int
 end
 
-# Score buffers for one anti-diagonal: current (H, E, F), previous (H1, E1,
-# F1) and the one before (H2).
+# Score buffers for one anti-diagonal: current (H, E, F, G), previous (H1,
+# E1, F1, G1) and the one before (H2). G is used only with soft clipping.
 mutable struct _Buffers{T<:Signed}
-    H::Vector{T}; E::Vector{T}; F::Vector{T}
-    H1::Vector{T}; E1::Vector{T}; F1::Vector{T}
+    H::Vector{T}; E::Vector{T}; F::Vector{T}; G::Vector{T}
+    H1::Vector{T}; E1::Vector{T}; F1::Vector{T}; G1::Vector{T}
     H2::Vector{T}
 end
 
-_Buffers{T}() where {T} = _Buffers{T}(T[], T[], T[], T[], T[], T[], T[])
+_Buffers{T}() where {T} = _Buffers{T}(T[], T[], T[], T[], T[], T[], T[], T[], T[])
 
 function _reset!(buf::_Buffers{T}, len::Int, neg::T) where {T}
-    for v in (buf.H, buf.E, buf.F, buf.H1, buf.E1, buf.F1, buf.H2)
+    for v in (buf.H, buf.E, buf.F, buf.G, buf.H1, buf.E1, buf.F1, buf.G1, buf.H2)
         resize!(v, len)
         fill!(v, neg)
     end
@@ -79,6 +95,8 @@ function _score_type(la::Int, lb::Int, sc::_Scoring)
     worst = abs(sc.mismatch) * min(la, lb) + sc.match * min(la, lb) +
             (sc.gap_open + max(sc.a_end_open, sc.b_end_open)) +
             max(sc.gap_extend, sc.a_end_extend, sc.b_end_extend) * (la + lb)
+    _clipping(sc) && (worst += 2 * (sc.clip_open + sc.clip_extend * la);
+                      maxpen = max(maxpen, sc.clip_open + sc.clip_extend))
     worst < 12_000 && maxpen < 1_000 ? Int16 : Int32
 end
 
@@ -93,8 +111,10 @@ Alignment of encoded sequences `a` (rows `i`) and `b` (columns `j`) from
 gap penalties of `sc`: with zero end gap penalties for `a`, `a` is fitted
 into `b`. A gap of length `n` costs `open + n * extend`. Ties prefer the
 diagonal, then a gap in `a`, then a gap in `b`; gap opening is preferred to
-extension. The operations of the path are left in `ws.ops`, in reverse
-order: `'M'` aligned pair, `'D'` gap in `a`, `'I'` gap in `b`.
+extension. With soft clipping (see `_Scoring`) a clipped end is used only if
+it scores strictly better. The operations of the path are left in `ws.ops`,
+in reverse order: `'M'` aligned pair, `'D'` gap in `a`, `'I'` gap in `b`
+(clipped bases of `a` are `'I'`).
 """
 _align(ws::_Workspace, a::AbstractVector{UInt8}, b::AbstractVector{UInt8}, klo::Int, khi::Int,
        sc::_Scoring) =
@@ -103,15 +123,18 @@ _align(ws::_Workspace, a::AbstractVector{UInt8}, b::AbstractVector{UInt8}, klo::
 function _align(ws::_Workspace, a::AbstractVector{UInt8}, b::AbstractVector{UInt8}, klo::Int,
                 khi::Int, sc::_Scoring, ::Type{T}) where {T<:Signed}
     buf = T === Int16 ? ws.buf16 : ws.buf32
-    score = _fill!(ws, buf::_Buffers{T}, a, b, klo, khi, sc)
+    score = _clipping(sc) ? _fill!(ws, buf::_Buffers{T}, a, b, klo, khi, sc, Val(true)) :
+                            _fill!(ws, buf::_Buffers{T}, a, b, klo, khi, sc, Val(false))
     _traceback(ws, a, b, klo, khi, score)
 end
 
 # Fills the trace matrix: one byte per cell, bits 0-1 origin of H (0
-# diagonal, 1 E, 2 F), bit 2 E extends E, bit 3 F extends F. Returns the score
-# of the alignment.
+# diagonal, 1 E, 2 F, 3 start after a clipped beginning of `a`), bit 2 E
+# extends E, bit 3 F extends F, bit 4 G extends G, bit 5 H comes from G (last
+# row only). Returns the score of the alignment.
 function _fill!(ws::_Workspace, buf::_Buffers{T}, a::AbstractVector{UInt8},
-                b::AbstractVector{UInt8}, klo::Int, khi::Int, sc::_Scoring) where {T}
+                b::AbstractVector{UInt8}, klo::Int, khi::Int, sc::_Scoring,
+                ::Val{C}) where {T,C}
     la = length(a); lb = length(b)
     M = (khi - klo) ÷ 2 + 1                  # slots per anti-diagonal
     neg = typemin(T) ÷ T(2)
@@ -130,12 +153,15 @@ function _fill!(ws::_Workspace, buf::_Buffers{T}, a::AbstractVector{UInt8},
 
     match = T(sc.match); mismatch = T(sc.mismatch)
     gap_oe = T(sc.gap_open + sc.gap_extend); gap_e = T(sc.gap_extend)
-    H, E, F, H1, E1, F1, H2 = buf.H, buf.E, buf.F, buf.H1, buf.E1, buf.F1, buf.H2
+    co = T(max(sc.clip_open, 0)); ce = T(max(sc.clip_extend, 0)); clip_oe = co + ce
+    H, E, F, G, H1, E1, F1, G1, H2 = buf.H, buf.E, buf.F, buf.G, buf.H1, buf.E1, buf.F1,
+                                     buf.G1, buf.H2
     @inbounds for d in 0:(la + lb)
         # Rotate: d-1 becomes "previous", d-2 "before previous".
         H, H1, H2 = H2, H, H1
         E, E1 = E1, E
         F, F1 = F1, F
+        G, G1 = G1, G
         kb = _kbase(d, klo)
         s = kb == klo ? -1 : 0               # slot shift of the neighbours on d - 1
         kmin = max(klo, -d, d - 2la)
@@ -145,12 +171,15 @@ function _fill!(ws::_Workspace, buf::_Buffers{T}, a::AbstractVector{UInt8},
         # Slots outside the matrix hold minus infinity.
         for m in 0:min(mlo - 1, M - 1)
             H[m+2] = neg; E[m+2] = neg; F[m+2] = neg
+            C && (G[m+2] = neg)
         end
         for m in max(mhi + 1, 0):(M - 1)
             H[m+2] = neg; E[m+2] = neg; F[m+2] = neg
+            C && (G[m+2] = neg)
         end
         mlo > mhi && continue
-        abase = la - ((d - kb) >> 1) + 2
+        ib = (d - kb) >> 1                   # row i of slot m is ib - m
+        abase = la - ib + 2
         bbase = ((d + kb) >> 1) + 1
         tbase = d * M + 1
         # Interior cells with internal gap penalties (vectorised).
@@ -170,22 +199,39 @@ function _fill!(ws::_Workspace, buf::_Buffers{T}, a::AbstractVector{UInt8},
             src = ifelse(e > diag, 0x01, 0x00)
             h = max(diag, e)
             src = ifelse(f > h, 0x02, src)
-            H[x] = max(h, f); E[x] = e; F[x] = f
-            trace[tbase+m] = src | (UInt8(eext) << 2) | (UInt8(fext) << 3)
+            hf = max(h, f)
+            tb = (UInt8(eext) << 2) | (UInt8(fext) << 3)
+            if C
+                # Start after clipping the first i bases of `a` (`% T`: no
+                # checked conversion, which would prevent vectorisation).
+                cs = -(co + ce * ((ib - m) % T))
+                src = ifelse(cs > hf, 0x03, src)
+                hf = max(hf, cs)
+                # End clip state (vertical, from the cell above).
+                g_open = H1[x+s+1] - clip_oe
+                g_ext = G1[x+s+1] - ce
+                gext = g_ext > g_open
+                G[x] = ifelse(gext, g_ext, g_open)
+                tb |= UInt8(gext) << 4
+            end
+            H[x] = hf; E[x] = e; F[x] = f
+            trace[tbase+m] = src | tb
         end
         # Cells in the first/last row or column (end gaps, origin) lie at the
         # ends of the slot range: recompute them.
-        _boundary_cell!(H, E, F, H1, E1, F1, H2, trace, arev, bpad, d, kb, mlo, s, la, lb,
-                        abase, bbase, tbase, neg, sc)
-        mhi > mlo && _boundary_cell!(H, E, F, H1, E1, F1, H2, trace, arev, bpad, d, kb, mhi,
-                                      s, la, lb, abase, bbase, tbase, neg, sc)
+        _boundary_cell!(H, E, F, G, H1, E1, F1, G1, H2, trace, arev, bpad, d, kb, mlo, s, la,
+                        lb, abase, bbase, tbase, neg, sc, Val(C), co, ce)
+        mhi > mlo && _boundary_cell!(H, E, F, G, H1, E1, F1, G1, H2, trace, arev, bpad, d, kb,
+                                      mhi, s, la, lb, abase, bbase, tbase, neg, sc, Val(C), co,
+                                      ce)
     end
     # After the last rotation H holds anti-diagonal la + lb.
     Int(H[((lb - la - _kbase(la + lb, klo)) >> 1) + 2])
 end
 
-@inline function _boundary_cell!(H::Vector{T}, E, F, H1, E1, F1, H2, trace, arev, bpad, d, kb, m, s,
-                         la, lb, abase, bbase, tbase, neg::T, sc::_Scoring) where {T}
+@inline function _boundary_cell!(H::Vector{T}, E, F, G, H1, E1, F1, G1, H2, trace, arev, bpad,
+                                 d, kb, m, s, la, lb, abase, bbase, tbase, neg::T,
+                                 sc::_Scoring, ::Val{C}, co::T, ce::T) where {T,C}
     k = kb + 2m
     i = (d - k) >> 1
     j = (d + k) >> 1
@@ -195,6 +241,7 @@ end
     x = m + 2
     @inbounds if i == 0 && j == 0
         H[x] = 0; E[x] = neg; F[x] = neg
+        C && (G[x] = neg)
         trace[tbase+m] = 0x00
         return nothing
     end
@@ -217,14 +264,37 @@ end
         src = ifelse(e > diag, 0x01, 0x00)
         h = max(diag, e)
         src = ifelse(f > h, 0x02, src)
-        H[x] = max(h, f); E[x] = e; F[x] = f
-        trace[tbase+m] = src | (UInt8(eext) << 2) | (UInt8(fext) << 3)
+        hf = max(h, f)
+        tb = (UInt8(eext) << 2) | (UInt8(fext) << 3)
+        if C
+            if i >= 1
+                cs = -(co + ce * T(i))
+                src = ifelse(cs > hf, 0x03, src)
+                hf = max(hf, cs)
+                g_open = H1[x+s+1] - co - ce
+                g_ext = G1[x+s+1] - ce
+                gext = g_ext > g_open
+                g = ifelse(gext, g_ext, g_open)
+                tb |= UInt8(gext) << 4
+                if i == la && g > hf         # end clip returns to H in the last row
+                    hf = g
+                    tb |= 0x20
+                end
+                G[x] = g
+            else
+                G[x] = neg
+            end
+        end
+        H[x] = hf; E[x] = e; F[x] = f
+        trace[tbase+m] = src | tb
     end
     nothing
 end
 
 # Follows the trace from (la, lb) to (0, 0); operations: 'M' aligned pair,
 # 'D' gap in `a` (consumes b), 'I' gap in `b` (consumes a), stored in reverse.
+# Clipped bases of `a` are 'I'; the bases of `b` before a clipped start are
+# 'D'.
 function _traceback(ws::_Workspace, a::AbstractVector{UInt8}, b::AbstractVector{UInt8}, klo::Int,
                     khi::Int, score::Int)
     la = length(a); lb = length(b)
@@ -242,7 +312,13 @@ function _traceback(ws::_Workspace, a::AbstractVector{UInt8}, b::AbstractVector{
         tb = trace[d*M + ((k - _kbase(d, klo)) >> 1) + 1]
         if state == 0
             src = tb & 0x03
-            if src == 0x00
+            if (tb & 0x20) != 0              # H from the end clip state
+                state = 3
+            elseif src == 0x03               # start after clipping the first i bases of a
+                for _ in 1:i; push!(ops, UInt8('I')); end
+                for _ in 1:j; push!(ops, UInt8('D')); end
+                i = 0; j = 0
+            elseif src == 0x00
                 (a[i] == b[j] && a[i] < 0x04) && (matches += 1)
                 aend == 0 && (aend = i; bend = j)
                 astart = i; bstart = j
@@ -254,9 +330,13 @@ function _traceback(ws::_Workspace, a::AbstractVector{UInt8}, b::AbstractVector{
             push!(ops, UInt8('D'))
             state = (tb & 0x04) != 0 ? 1 : 0
             j -= 1
-        else
+        elseif state == 2
             push!(ops, UInt8('I'))
             state = (tb & 0x08) != 0 ? 2 : 0
+            i -= 1
+        else
+            push!(ops, UInt8('I'))
+            state = (tb & 0x10) != 0 ? 3 : 0
             i -= 1
         end
     end

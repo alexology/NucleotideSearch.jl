@@ -26,8 +26,39 @@ function reference_score(a::Vector{UInt8}, b::Vector{UInt8}, sc::_Scoring)
         diag = i > 0 && j > 0 ?
                H[i, j] + (a[i] == b[j] && a[i] < 0x04 ? sc.match : sc.mismatch) : neg
         H[i+1, j+1] = max(diag, E[i+1, j+1], F[i+1, j+1])
+        # Soft clipping: start anywhere after clipping the first i bases of a.
+        sc.clip_open >= 0 && i >= 1 &&
+            (H[i+1, j+1] = max(H[i+1, j+1], -(sc.clip_open + sc.clip_extend * i)))
     end
-    H[la+1, lb+1]
+    best = H[la+1, lb+1]
+    if sc.clip_open >= 0                    # or end anywhere, clipping the rest of a
+        for i in 0:la, j in 0:lb
+            best = max(best, H[i+1, j+1] - (sc.clip_open + sc.clip_extend * (la - i)))
+        end
+    end
+    best
+end
+
+# Score of a clipped path: the part from the first to the last aligned pair
+# with internal penalties, plus the clipping costs of the unaligned ends of `a`.
+function clipped_path_score(ops, a, b, sc::_Scoring, st)
+    st.aend == 0 && return -(sc.clip_open + sc.clip_extend * length(a))
+    i = st.astart - 1; j = st.bstart - 1
+    s = 0; prev = 0x00
+    lo = findfirst(==(UInt8('M')), ops); hi = findlast(==(UInt8('M')), ops)
+    for k in hi:-1:lo
+        o = ops[k]
+        if o == UInt8('M')
+            i += 1; j += 1
+            s += (a[i] == b[j] && a[i] < 4) ? sc.match : sc.mismatch
+        else
+            s -= sc.gap_extend + (prev == o ? 0 : sc.gap_open)
+            o == UInt8('D') ? (j += 1) : (i += 1)
+        end
+        prev = o
+    end
+    clip(n) = n == 0 ? 0 : sc.clip_open + sc.clip_extend * n
+    s - clip(st.astart - 1) - clip(length(a) - st.aend)
 end
 
 # Score of the path left in the workspace by `_align` (operations in reverse).
@@ -104,12 +135,27 @@ end
         b = rand(rng) < 0.5 ? mutate(rng, a, 0.2) : randseq(rng, lb)
         isempty(b) && (b = randseq(rng, 3))
         rand(rng) < 0.1 && (a[rand(rng, 1:length(a))] = 0x04)
-        sc = _Scoring(rand(rng, 1:3), -rand(rng, 1:5), rand(rng, 0:20), rand(rng, 0:3),
-                      rand(rng, 0:5), rand(rng, 0:2), rand(rng, 0:5), rand(rng, 0:2))
+        clip = rand(rng) < 0.4
+        if clip
+            # `:query` mode: clipping costs as much as target end gaps. Gaps
+            # cost strictly more than clipping (open > clip open, extend >= clip
+            # extend), as with the defaults (20 + 2n against 20 + n), so that an
+            # unaligned end is always a clip and `clipped_path_score` applies.
+            go = rand(rng, 1:20); co = rand(rng, 0:go-1); ce = rand(rng, 0:2)
+            sc = _Scoring(rand(rng, 1:3), -rand(rng, 1:5), go, rand(rng, ce:3),
+                          0, 0, co, ce, co, ce)
+        else
+            sc = _Scoring(rand(rng, 1:3), -rand(rng, 1:5), rand(rng, 0:20), rand(rng, 0:3),
+                          rand(rng, 0:5), rand(rng, 0:2), rand(rng, 0:5), rand(rng, 0:2))
+        end
         ws = _Workspace()
         st = _align(ws, a, b, -length(a), length(b), sc, Int16)
         @test st.score == reference_score(a, b, sc)
-        @test path_score(ws.ops, a, b, sc) == st.score
+        if clip
+            @test clipped_path_score(ws.ops, a, b, sc, st) == st.score
+        else
+            @test path_score(ws.ops, a, b, sc) == st.score
+        end
         @test st.columns == length(ws.ops)
         @test st.matches + st.mismatches <= min(length(a), length(b))
         @test !st.touches_band_edge
@@ -183,6 +229,20 @@ end
     @test (r4.query_start, r4.query_end) == (1, 50)
     @test r4.cigar == "50M50S"
 
+    # An end that differs entirely while the target continues is soft-clipped
+    # (20 + n) instead of being forced into the alignment.
+    q5 = copy(q); q5[71:100] .= (q5[71:100] .+ 0x01) .% 0x04
+    r5 = align(q5, target; mode = :query)
+    @test (r5.query_start, r5.query_end) == (1, 70)
+    @test (r5.target_start, r5.target_end) == (101, 170)
+    @test r5.cigar == "70M30S"
+    q6 = copy(q); q6[1:25] .= (q6[1:25] .+ 0x02) .% 0x04
+    r6 = align(q6, target; mode = :query)
+    @test r6.cigar == "25S75M" && (r6.target_start, r6.target_end) == (126, 200)
+    # Global mode never clips.
+    @test !NucleotideSearch._clipping(_kernel_scoring(Scoring(), :global))
+    @test NucleotideSearch._clipping(_kernel_scoring(Scoring(), :query))
+
     g = align("ACGTACGT", "ACGTTCGT")
     @test g.matches == 7 && g.mismatches == 1 && g.cigar == "8M"
     @test_throws ArgumentError align("", "ACGT")
@@ -250,6 +310,10 @@ end
         full = align(a, refs[t]; mode = :query)
         @test best.score == full.score
     end
+    @test_throws ArgumentError search(queries, db; iddef = 1)
+    @test_throws ArgumentError search(queries, db; strand = :minus)
+    @test length(search(queries[1:2], db; mode = :global, iddef = 1, min_identity = 10,
+                        query_cov = 0.1)) == 2
     @test search(queries, db; strand = :plus)[findfirst(x -> x[2] == '-', truth)] |>
           h -> all(x -> x.strand == '+', h)
     # One query given as a string.
