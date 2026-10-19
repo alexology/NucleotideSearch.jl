@@ -9,8 +9,14 @@
 One accepted alignment of a search. Fields: `query`, `target` (indices),
 `strand` (`'+'`, or `'-'` if the reverse complement of the query was
 aligned), `identity` (percent, see `iddef` in [`search`](@ref)), `score`,
-`matches`, `mismatches`, `gap_openings`, `columns`, `query_start`,
-`query_end`, `target_start`, `target_end`, `cigar`.
+`matches`, `mismatches`, `gap_openings`, `columns`, `aligned_columns`,
+`query_start`, `query_end`, `target_start`, `target_end`, `cigar`.
+
+`aligned_columns` counts the alignment columns and `gap_openings` the gaps
+from the first to the last aligned pair (end gaps excluded; `iddef = 3`
+still counts end gaps, as VSEARCH). `columns` also counts the end gaps; in `:query` mode the
+unaligned target bases counted there depend on the window used, so use
+`aligned_columns` (plus unaligned query bases, if wanted) instead.
 
 Coordinates are 1-based and inclusive and give the first and last bases in an
 aligned pair. Query coordinates refer to the query as given (also on the
@@ -30,6 +36,7 @@ struct Hit
     mismatches::Int
     gap_openings::Int
     columns::Int
+    aligned_columns::Int
     query_start::Int
     query_end::Int
     target_start::Int
@@ -143,8 +150,8 @@ end
 function _hit(q::Int, tg::Int, strand::Char, id::Float64, st::_AlignStats, la::Int, cigar::String)
     qs, qe = strand == '+' ? (st.astart, st.aend) :
              st.aend == 0 ? (0, 0) : (la - st.aend + 1, la - st.astart + 1)
-    Hit(q, tg, strand, id, st.score, st.matches, st.mismatches, st.gap_openings, st.columns,
-        qs, qe, st.bstart, st.bend, cigar)
+    Hit(q, tg, strand, id, st.score, st.matches, st.mismatches, st.internal_gap_openings, st.columns,
+        st.columns - st.terminal_gap_columns, qs, qe, st.bstart, st.bend, cigar)
 end
 
 # Hits are sorted by decreasing identity (stable: candidate order on ties).
@@ -211,7 +218,8 @@ end
 # The pair was aligned as (x, y) = (t, q): swap the roles back.
 _swap(st::_AlignStats) =
     _AlignStats(st.score, st.matches, st.mismatches, st.columns, st.terminal_gap_columns,
-                st.gap_openings, st.touches_band_edge, st.bstart, st.bend, st.astart, st.aend)
+                st.gap_openings, st.internal_gap_openings, st.touches_band_edge, st.bstart,
+                st.bend, st.astart, st.aend)
 
 function _search_self_query(st::_SearchState, q::Int, db::SequenceDB, cache::_PairCache,
                             s::_SearchSettings)
@@ -352,7 +360,8 @@ function _query_stats(st::_SearchState, a::AbstractVector{UInt8}, b::AbstractVec
                 inside = r.aend > 0 && (lo == 1 || r.bstart > 1) && (hi == lb || r.bend < lw)
                 if inside && !r.touches_band_edge
                     return _AlignStats(r.score, r.matches, r.mismatches, r.columns,
-                                       r.terminal_gap_columns, r.gap_openings, false,
+                                       r.terminal_gap_columns, r.gap_openings,
+                                       r.internal_gap_openings, false,
                                        r.astart, r.aend, r.bstart + lo - 1, r.bend + lo - 1)
                 end
             end

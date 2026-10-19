@@ -51,7 +51,7 @@ SequenceDB(records::AbstractVector{<:Pair}; k::Integer = 8) =
     SequenceDB([string(first(r)) for r in records], [last(r) for r in records]; k)
 
 function SequenceDB(fasta_path::AbstractString; k::Integer = 8)
-    ids, seqs = _read_fasta(fasta_path)
+    ids, seqs = read_fasta(fasta_path)
     SequenceDB(ids, seqs; k)
 end
 
@@ -74,9 +74,13 @@ function _build(ids::Vector{String}, data::Vector{UInt8}, starts::Vector{Int}, k
     SequenceDB(ids, data, starts, k, offsets, postings)
 end
 
-# Minimal FASTA reader: header up to the first whitespace, sequence lines
-# concatenated (surrounding whitespace removed).
-function _read_fasta(path::AbstractString)
+"""
+    NucleotideSearch.read_fasta(path) -> (ids, sequences)
+
+Minimal FASTA reader (not exported): the id is the header up to the first
+whitespace; sequence lines are concatenated without surrounding whitespace.
+"""
+function read_fasta(path::AbstractString)
     ids = String[]; seqs = String[]
     buf = IOBuffer()
     open(path) do io

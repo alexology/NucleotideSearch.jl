@@ -159,6 +159,7 @@ end
     @test (r.query_start, r.query_end) == (1, 100)
     @test r.matches == 100 && r.mismatches == 0
     @test r.cigar == "100M"
+    @test r.gap_openings == 0          # the unaligned target ends are not gaps
 
     # Mismatches at both ends of the query are not clipped.
     q2 = copy(q); q2[1] = (q2[1] + 1) % 4; q2[2] = (q2[2] + 1) % 4; q2[end] = (q2[end] + 2) % 4
@@ -241,6 +242,9 @@ end
         @test (best.target_start, best.target_end) == (start, stop)
         @test (best.query_start, best.query_end) == (1, length(q))
         @test cigar_lengths(best.cigar) == (length(q), stop - start + 1)
+        @test best.aligned_columns ==
+              sum(parse(Int, m[1]) for m in eachmatch(r"(\d+)[MID]", best.cigar))
+        @test best.gap_openings == count(m -> m[1] != "M", eachmatch(r"\d+([MID])", best.cigar))
         # Same result as the unbanded alignment on the whole target.
         a = strand == '+' ? q : reverse_complement(q)
         full = align(a, refs[t]; mode = :query)

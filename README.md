@@ -22,7 +22,8 @@ The kernel is a banded affine-gap (Gotoh) dynamic programming filled by
 anti-diagonals, vectorised (SIMD) with 16-bit scores (32-bit when needed).
 Queries run on all threads; results do not depend on the number of threads.
 
-Julia ≥ 1.10.
+Julia ≥ 1.10. License: MIT. Used by [LULU.jl](../LULU.jl) and
+[ASVCoordinates.jl](../ASVCoordinates.jl).
 
 ## Installation
 
@@ -107,7 +108,7 @@ Notes:
 ## Validation
 
 - `test/runtests.jl` (`julia -t 4 --project=. -e 'using Pkg; Pkg.test()'`,
-  about 3,200 tests, 20 s): the kernel against a full-matrix reference
+  about 3,300 tests, 20 s): the kernel against a full-matrix reference
   dynamic programming with random scores, end-gap penalties and both score
   widths, including the traceback score; coordinates and CIGAR strings on
   synthetic references with mutated query ends, indels, both strands and

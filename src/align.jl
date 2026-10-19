@@ -71,8 +71,9 @@ _kernel_scoring(sc::Scoring, mode::Symbol) =
 """
     PairAlignment
 
-Result of [`align`](@ref): `score`, `matches`, `mismatches`, `gap_openings`,
-`columns` (alignment columns, including end gaps), `query_start`,
+Result of [`align`](@ref): `score`, `matches`, `mismatches`, `gap_openings`
+(between the first and the last aligned pair), `columns` (alignment
+columns, including end gaps), `query_start`,
 `query_end`, `target_start`, `target_end` (1-based, inclusive, first and last
 bases in an aligned pair; `0` if there is none), `cigar` (see [`Hit`](@ref)).
 """
@@ -108,6 +109,6 @@ function align(query, target; mode::Symbol = :global,
     (la == 0 || lb == 0) && throw(ArgumentError("sequences must not be empty"))
     ws = _Workspace()
     st = _align(ws, a, b, -la, lb, _kernel_scoring(scoring, mode))
-    PairAlignment(st.score, st.matches, st.mismatches, st.gap_openings, st.columns,
+    PairAlignment(st.score, st.matches, st.mismatches, st.internal_gap_openings, st.columns,
                   st.astart, st.aend, st.bstart, st.bend, _cigar(ws.ops, st, la))
 end

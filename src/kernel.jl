@@ -32,7 +32,8 @@ struct _AlignStats
     mismatches::Int
     columns::Int
     terminal_gap_columns::Int   # columns before the first / after the last aligned pair
-    gap_openings::Int
+    gap_openings::Int           # including end gaps (used by iddef 3)
+    internal_gap_openings::Int  # between the first and the last aligned pair
     touches_band_edge::Bool     # the path reaches a band diagonal inside the matrix
     astart::Int                 # first and last positions of `a` and `b` in an
     aend::Int                   # aligned pair (0 if there is none)
@@ -265,12 +266,17 @@ function _traceback(ws::_Workspace, a::AbstractVector{UInt8}, b::AbstractVector{
     aligned = count(==(UInt8('M')), ops)
     terminal = first_m === nothing ? ncol :
                (first_m - 1) + (ncol - findlast(==(UInt8('M')), ops))
-    openings = 0
+    openings = 0; internal = 0
+    lo = first_m === nothing ? 1 : first_m
+    hi = first_m === nothing ? 0 : findlast(==(UInt8('M')), ops)
     @inbounds for k in 1:ncol
         o = ops[k]
-        o != UInt8('M') && (k == 1 || ops[k-1] != o) && (openings += 1)
+        if o != UInt8('M') && (k == 1 || ops[k-1] != o)
+            openings += 1
+            lo < k < hi && (internal += 1)
+        end
     end
-    _AlignStats(score, matches, aligned - matches, ncol, terminal, openings, edge,
+    _AlignStats(score, matches, aligned - matches, ncol, terminal, openings, internal, edge,
                 astart, aend, bstart, bend)
 end
 
