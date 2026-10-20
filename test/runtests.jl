@@ -276,6 +276,26 @@ end
     @test_throws DimensionMismatch SequenceDB(["a"], ["ACGT", "ACGT"])
 end
 
+@testset "read_fasta" begin
+    fasta = tempname()
+    readfa(text) = (write(fasta, text); NucleotideSearch.read_fasta(fasta))
+    try
+        @test readfa(">a desc\nACGT\nAC\n>b\nTTTT\n") == (["a", "b"], ["ACGTAC", "TTTT"])
+        @test readfa(">a desc\r\nACGT\r\nAC\r\n>b\r\nTTTT\r\n") == (["a", "b"], ["ACGTAC", "TTTT"])
+        @test readfa("\n>a\nACGT\n\nAC\n\n>b\nTTTT") == (["a", "b"], ["ACGTAC", "TTTT"])
+        @test readfa(">a\nacgtNRY-.\n") == (["a"], ["acgtNRY-."])
+        @test readfa(">a  \n  AC GT \n\tAC\n") == (["a"], ["ACGTAC"])
+        @test readfa("> a desc\nACGT\n") == (["a"], ["ACGT"])
+        @test readfa(">\nACGT\n") == ([""], ["ACGT"])
+        @test readfa(">a\n\n>b\nACGT\n") == (["a", "b"], ["", "ACGT"])
+        @test readfa("") == (String[], String[])
+        @test_throws ArgumentError readfa("ACGT\n>a\nAC\n")
+        @test_throws ArgumentError readfa(">a\n>b\nACGT\n")
+    finally
+        rm(fasta; force = true)
+    end
+end
+
 @testset "search: coordinates on a reference database" begin
     rng = MersenneTwister(3)
     refs = [randseq(rng, rand(rng, 600:900)) for _ in 1:200]

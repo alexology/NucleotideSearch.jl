@@ -3,7 +3,11 @@ uuid = "573b8192-02fb-42eb-bd24-85f898daf624"
 version = "0.1.0"
 authors = ["Alex Laini"]
 
+[deps]
+FASTX = "c2308a5c-f048-11e8-3e8a-31650f418d12"
+
 [compat]
+FASTX = "2"
 Random = "1"
 Test = "1"
 julia = "1.10"

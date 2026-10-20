@@ -18,6 +18,8 @@ The k-mer prefilter and the banded, vectorised affine-gap kernel come from
 """
 module NucleotideSearch
 
+import FASTX
+
 export Scoring, SequenceDB, Hit, PairAlignment
 export encode, reverse_complement, align, search, search_self, save_db, load_db
 export nsequences

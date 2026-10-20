@@ -2,7 +2,8 @@
 
 Pure Julia search and pairwise alignment of nucleotide sequences (amplicons,
 ASVs, OTUs), against each other or against a reference database. No external
-programs (BLAST, VSEARCH) and no dependencies outside Base.
+programs (BLAST, VSEARCH); the only dependency is FASTX.jl, used to read FASTA
+files.
 
 - **`search`** fits each query into reference sequences (`:query` mode, the
   default). The whole query is aligned, and gaps at its ends (unaligned

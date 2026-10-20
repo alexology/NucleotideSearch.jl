@@ -77,29 +77,38 @@ end
 """
     NucleotideSearch.read_fasta(path) -> (ids, sequences)
 
-Minimal FASTA reader (not exported): the id is the header up to the first
-whitespace; sequence lines are concatenated without surrounding whitespace.
+FASTA reader based on FASTX.jl (not exported): the id is the header up to the
+first whitespace; sequence lines are concatenated with all whitespace removed
+and case preserved. Malformed input, including an empty record directly
+followed by another header, raises an `ArgumentError`.
 """
 function read_fasta(path::AbstractString)
     ids = String[]; seqs = String[]
-    buf = IOBuffer()
-    open(path) do io
-        for line in eachline(io)
-            line = strip(line)
-            isempty(line) && continue
-            if startswith(line, '>')
-                isempty(ids) || push!(seqs, String(take!(buf)))
-                h = strip(line[2:end])
-                push!(ids, isempty(h) ? "" : String(first(split(h))))
-            else
-                isempty(ids) && throw(ArgumentError("$path: sequence data before the first header"))
-                print(buf, line)
+    reader = FASTX.FASTAReader(open(path); copy = false)
+    try
+        for rec in reader
+            id = FASTX.identifier(rec)
+            if isempty(id)   # header such as "> id description"
+                words = split(FASTX.description(rec))
+                id = isempty(words) ? "" : first(words)
             end
+            push!(ids, String(id))
+            push!(seqs, _strip_whitespace(FASTX.sequence(String, rec)))
         end
+    catch e
+        e isa ErrorException || e isa EOFError || rethrow()
+        throw(ArgumentError("$path: invalid FASTA ($(sprint(showerror, e)))"))
+    finally
+        close(reader)
     end
-    isempty(ids) || push!(seqs, String(take!(buf)))
     ids, seqs
 end
+
+_isspace_byte(b::UInt8) = b == UInt8(' ') || b == UInt8('\t') || b == UInt8('\r') ||
+                          b == UInt8('\v') || b == UInt8('\f')
+
+_strip_whitespace(s::String) =
+    any(_isspace_byte, codeunits(s)) ? String(filter(!_isspace_byte, codeunits(s))) : s
 
 const _MAGIC = b"NSDB"
 const _FORMAT_VERSION = UInt32(1)
