@@ -88,18 +88,29 @@ function _settings(mode, min_identity, iddef, query_cov, maxhits, maxaccepts, ma
                     _kernel_scoring(scoring, mode), cigar, max_postings)
 end
 
-# Diagonal band for sequences of lengths `la` and `lb`. Under iddef 1/4 an
-# alignment with identity >= t has at most `slack` gap columns, so it stays
-# within (slack -/+ (lb - la)) / 2 of the main diagonal. Other definitions get a
-# wider band.
+# Diagonal band containing every alignment of sequences of lengths `la` and
+# `lb` that can be accepted. Under iddef 1/4 an alignment with identity >= t
+# has at most `slack` gap columns, so it stays within (slack -/+ (lb - la)) / 2
+# of the main diagonal. The other definitions ignore end gaps (0, 2) or count
+# only their openings (3), so the overhangs are bounded by the number `A` of
+# aligned pairs instead: every point of the path has between `la - A` unpaired
+# bases of `a` and `lb - A` of `b` behind it, so `A - la <= j - i <= lb - A`.
+# An accepted hit has `A >= query_cov` times the query length (either sequence
+# in `search_self`, hence the shorter one) and, under iddef 0, `A >= matches >=
+# t * min(la, lb)`.
 function _band(la::Int, lb::Int, s::_SearchSettings)
     t = s.min_identity
-    slack = t > 0 ? floor(Int, (1 - t) / t * min(la, lb)) : la + lb
     delta = lb - la
     if s.iddef == 1 || s.iddef == 4
+        slack = t > 0 ? floor(Int, (1 - t) / t * min(la, lb)) : la + lb
         max(-la, min(0, delta, -fld(slack - delta, 2))), min(lb, max(0, delta, fld(slack + delta, 2)))
     else
-        max(-la, min(0, delta) - slack), min(lb, max(0, delta) + slack)
+        short = min(la, lb)
+        amin = s.query_cov * short
+        s.iddef == 0 && (amin = max(amin, s.id_threshold / 100 * short))
+        # One pair less, for rounding
+        amin = clamp(floor(Int, amin) - 1, 0, short)
+        max(-la, amin - la), min(lb, lb - amin)
     end
 end
 
@@ -156,37 +167,104 @@ function _hit(q::Int, tg::Int, strand::Char, id::Float64, st::_AlignStats, la::I
 end
 
 # Hits are sorted by decreasing identity (stable: candidate order on ties).
+"""
+    SearchReport
+
+How the search of one query ended, from [`search`](@ref) and
+[`search_self`](@ref) with `reports`. Fields:
+
+- `candidates`: targets (× strands) sharing enough k-mers with the query to
+  be considered (`minwordmatches`);
+- `examined`: candidates checked, in ranking order (length test, then
+  alignment);
+- `accepted`, `rejected`: of the examined candidates;
+- `stop`: `:maxaccepts` or `:maxrejects` if that limit ended the search,
+  even on the last candidate; `:exhausted` if candidates ran out without
+  reaching either limit;
+- `exhaustive`: every target of the database (every strand) was examined, so
+  no better hit can exist elsewhere, independently of `stop` (the query
+  itself is excluded in `search_self`). Otherwise the hits are the best among
+  the examined candidates only; each hit's alignment is optimal for its pair
+  either way.
+"""
+struct SearchReport
+    candidates::Int
+    examined::Int
+    accepted::Int
+    rejected::Int
+    stop::Symbol
+    exhaustive::Bool
+end
+
+function _report(candidates, examined, accepted, rejected, stop, possible)
+    SearchReport(candidates, examined, accepted, rejected, stop,
+                 examined == possible)
+end
+
+_check_reports(reports, n) = reports === nothing || resize!(reports, n)
+
 function _finish!(hits::Vector{Hit}, s::_SearchSettings)
     sort!(hits; alg = MergeSort, by = h -> -h.identity)
     s.maxhits > 0 && length(hits) > s.maxhits && resize!(hits, s.maxhits)
     hits
 end
 
-function _run_parallel(f, n::Int, ntargets::Int)
-    chunks = Iterators.partition(1:n, max(1, cld(n, 8 * Threads.nthreads())))
-    tasks = map(chunks) do range
+# `f(state, q)` for every query `q` on at most `threads` tasks, each with its
+# own search state (scratch sized by the database); `threads = 1` runs on the
+# calling task. Queries are handed out in chunks, so the result does not
+# depend on the scheduling.
+function _run_parallel(f, n::Int, ntargets::Int, threads::Int)
+    threads >= 1 || throw(ArgumentError("threads must be at least 1"))
+    nworkers = min(threads, n)
+    if nworkers <= 1
+        state = _SearchState(ntargets)
+        for q in 1:n
+            f(state, q)
+        end
+        return
+    end
+    chunk = max(1, cld(n, 8 * nworkers))
+    next = Threads.Atomic{Int}(1)
+    tasks = map(1:nworkers) do _
         Threads.@spawn begin
-            state = _SearchState(ntargets)
-            for q in range
-                f(state, q)
+            # `local`: the serial branch's `state` must not be captured and shared
+            local state = _SearchState(ntargets)
+            while (lo = Threads.atomic_add!(next, chunk)) <= n
+                for q in lo:min(n, lo + chunk - 1)
+                    f(state, q)
+                end
             end
         end
     end
-    foreach(wait, tasks)
+    failure = nothing
+    for task in tasks
+        try
+            wait(task)
+        catch e
+            failure === nothing && (failure = e)
+        end
+    end
+    failure === nothing || throw(failure)
 end
 
 # ---------------------------------------------------------------------------
 # All against all
 
 # Alignments shared between the two directions of a pair, in lock-striped
-# dictionaries. An entry is removed when it is used the second time.
+# dictionaries. An entry is removed when it is used the second time. Each
+# stripe has a fixed share of the entry budget; full stripes skip insertion.
 struct _PairCache
     tables::Vector{Dict{Int,_AlignStats}}
     locks::Vector{ReentrantLock}
+    max_entries::Int
 end
 
-_PairCache(nstripes::Int) =
-    _PairCache([Dict{Int,_AlignStats}() for _ in 1:nstripes], [ReentrantLock() for _ in 1:nstripes])
+function _PairCache(nstripes::Int; max_entries::Int = 100_000)
+    nstripes > 0 || throw(ArgumentError("cache stripe count must be positive"))
+    max_entries >= 0 || throw(ArgumentError("cache_entries must be non-negative"))
+    _PairCache([Dict{Int,_AlignStats}() for _ in 1:nstripes],
+               [ReentrantLock() for _ in 1:nstripes], max_entries)
+end
 
 function _get_or_align!(compute, cache::_PairCache, key::Int)
     stripe = mod1(key, length(cache.tables))
@@ -196,21 +274,37 @@ function _get_or_align!(compute, cache::_PairCache, key::Int)
     cached === nothing || return cached
     st = compute()   # outside the lock; a concurrent duplicate gives the same result
     lock(lk) do
-        haskey(table, key) ? delete!(table, key) : (table[key] = st)
+        limit = div(cache.max_entries, length(cache.tables)) +
+                Int(stripe <= rem(cache.max_entries, length(cache.tables)))
+        if haskey(table, key)
+            delete!(table, key)
+        elseif length(table) < limit
+            table[key] = st
+        end
     end
     st
 end
 
-# Alignment of sequences `x` < `y`. A pair is always aligned in this canonical
-# orientation, so (q, t) and (t, q) share one alignment (identity and number of
-# aligned pairs are symmetric). An accepted alignment that touches the band edge
-# may not be optimal: it is recomputed without band.
+# With the same end gap penalties for both sequences, swapping them gives the
+# same optimal alignment.
+_symmetric(sc::_Scoring) = sc.a_end_open == sc.b_end_open && sc.a_end_extend == sc.b_end_extend
+
+# Alignment of sequences `x` and `y`. With symmetric scoring a pair is always
+# aligned in the canonical orientation `x < y`, so (q, t) and (t, q) share one
+# alignment (identity and number of aligned pairs are symmetric); otherwise each
+# direction is aligned on its own.
 function _pair_stats(ws::_Workspace, db::SequenceDB, x::Int, y::Int, s::_SearchSettings)
     a = _seq(db, x); b = _seq(db, y)
+    _global_stats(ws, a, b, s)
+end
+
+function _global_stats(ws::_Workspace, a, b, s::_SearchSettings)
     la = length(a); lb = length(b)
     klo, khi = _band(la, lb, s)
     st = _align(ws, a, b, klo, khi, s.scoring)
-    if st.touches_band_edge && _identity(st, la, lb, s.iddef) >= s.id_threshold
+    # A tie outside the band can change identity or coverage under the kernel's
+    # traceback rules, so only a strict score bound certifies the result.
+    if ws.outside_bound >= st.score
         st = _align(ws, a, b, -la, lb, s.scoring)
     end
     st
@@ -228,33 +322,44 @@ function _search_self_query(st::_SearchState, q::Int, db::SequenceDB, cache::_Pa
     la = _seqlen(db, q)
     accepted = Hit[]
     rejected = 0
-    for tg in _rank_candidates!(st, _unique_kmers(_seq(db, q), db.k), db, s)
+    candidates = _rank_candidates!(st, _unique_kmers(_seq(db, q), db.k), db, s)
+    ncand = length(candidates) - (q in candidates)
+    stop = :exhausted
+    for tg in candidates
         tg == q && continue
         lb = _seqlen(db, tg)
         ok = false
         if _length_compatible(la, lb, s)
-            x, y = minmax(q, tg)
-            stats = _get_or_align!(cache, (x - 1) * n + y) do
-                _pair_stats(st.ws, db, x, y, s)
+            if _symmetric(s.scoring)
+                x, y = minmax(q, tg)
+                stats = _get_or_align!(cache, (x - 1) * n + y) do
+                    _pair_stats(st.ws, db, x, y, s)
+                end
+                q > tg && (stats = _swap(stats))
+            else
+                stats = _pair_stats(st.ws, db, q, tg, s)
             end
             id = _identity(stats, la, lb, s.iddef)
             ok = id >= s.id_threshold && stats.matches + stats.mismatches >= s.query_cov * la
-            ok && push!(accepted, _hit(q, tg, '+', id, q < tg ? stats : _swap(stats), la, ""))
+            ok && push!(accepted, _hit(q, tg, '+', id, stats, la, ""))
         end
         if ok
-            s.maxaccepts > 0 && length(accepted) >= s.maxaccepts && break
+            s.maxaccepts > 0 && length(accepted) >= s.maxaccepts && (stop = :maxaccepts; break)
         else
             rejected += 1
-            s.maxrejects > 0 && rejected >= s.maxrejects && break
+            s.maxrejects > 0 && rejected >= s.maxrejects && (stop = :maxrejects; break)
         end
     end
-    _finish!(accepted, s)
+    report = _report(ncand, length(accepted) + rejected, length(accepted), rejected, stop, n - 1)
+    _finish!(accepted, s), report
 end
 
 """
     search_self(db::SequenceDB; min_identity = 84, iddef = 1, query_cov = 0.9,
                 maxhits = 10, maxaccepts = 0, maxrejects = 32,
-                minwordmatches = 12, scoring = Scoring()) -> Vector{Vector{Hit}}
+                minwordmatches = 12, scoring = Scoring(), reports = nothing,
+                threads = Threads.nthreads(), cache_entries = 100_000)
+        -> Vector{Vector{Hit}}
 
 Search every sequence of `db` (query) against all the others (targets) with
 a global alignment, as `vsearch --usearch_global --self`; element `q` of the
@@ -275,7 +380,10 @@ For each query:
    `maxhits` (0: all) are kept.
 
 With `maxrejects = 0` and `minwordmatches = 0` every pair is aligned
-(exhaustive search; slow for large data sets).
+(exhaustive search; slow for large data sets). Pass `reports =
+SearchReport[]` to receive, for each query, a [`SearchReport`](@ref): how
+many candidates were examined, why the search stopped and whether it covered
+the whole database.
 
 Identity definitions (`iddef`, as in VSEARCH): `0`: matches / length of the
 shorter sequence; `1` and `4`: matches / alignment columns; `2`: matches /
@@ -284,21 +392,30 @@ length of the longer sequence`. Bases other than A, C, G, T/U never count as
 matches.
 
 The alignment is restricted to a diagonal band wide enough for every
-alignment with identity `>= min_identity` under `iddef` 1. Queries run in
-parallel on `Threads.nthreads()` threads; the result does not depend on the
-number of threads.
+alignment that can be accepted (identity under `iddef` and `query_cov`). A
+score bound certifies that no path outside the band can tie or beat its
+optimum; otherwise the pair is recomputed without band. The reciprocal cache
+holds at most `cache_entries` alignments (0 disables it); full stripes
+recompute pairs instead, preserving the same results. Queries run in
+parallel on `threads` tasks (default `Threads.nthreads()`; `1` runs on the
+calling task, e.g. inside an already parallel pipeline); the result does not
+depend on the number of threads.
 """
 function search_self(db::SequenceDB; min_identity::Real = 84, iddef::Integer = 1,
                      query_cov::Real = 0.9, maxhits::Integer = 10, maxaccepts::Integer = 0,
                      maxrejects::Integer = 32, minwordmatches::Integer = 12,
-                     scoring::Scoring = Scoring())
+                     scoring::Scoring = Scoring(),
+                     reports::Union{Nothing,Vector{SearchReport}} = nothing,
+                     threads::Integer = Threads.nthreads(), cache_entries::Integer = 100_000)
     s = _settings(:global, min_identity, iddef, query_cov, maxhits, maxaccepts, maxrejects,
                   minwordmatches, scoring, false)
     n = nsequences(db)
-    cache = _PairCache(64)
+    cache = _PairCache(64; max_entries = Int(cache_entries))
     results = Vector{Vector{Hit}}(undef, n)
-    _run_parallel(n, n) do state, q
-        results[q] = _search_self_query(state, q, db, cache, s)
+    _check_reports(reports, n)
+    _run_parallel(n, n, Int(threads)) do state, q
+        results[q], report = _search_self_query(state, q, db, cache, s)
+        reports === nothing || (reports[q] = report)
     end
     results
 end
@@ -340,10 +457,51 @@ function _seed_diagonal(st::_SearchState, si::Int, t::AbstractVector{UInt8}, k::
     best
 end
 
+# Proof that an alignment of the query (length `la`) scoring `score` in a
+# window of the target is optimal on the whole target (q-gram lemma). An
+# alignment scoring at least as much loses at most `deficit` points against a perfect
+# match of the query, and each difference destroys a bounded number of query
+# k-mers per point lost: a mismatch at most k, a run of n inserted query bases
+# n + k - 1, a run of deleted target bases k - 1, an unaligned query end of n
+# bases n. Such an alignment therefore keeps at least `need` of the `nunique`
+# k-mers unique in the query as seeds (`diags`, sorted), and its diagonals span
+# at most `width` (its inserted and deleted bases). Every group of `need` seeds
+# that close must lie where the window alignment could have used them: inside
+# the window band (`kwlo:kwhi`, whole-target diagonals) and the window `lo:hi`.
+function _window_optimal(diags::Vector{Int}, nunique::Int, score::Int, la::Int, lb::Int,
+                         lo::Int, hi::Int, kwlo::Int, kwhi::Int, k::Int, sc::_Scoring)
+    m = Int(sc.match); x = m - Int(sc.mismatch)
+    go = Int(sc.gap_open); ge = Int(sc.gap_extend)
+    ee = Int(sc.b_end_extend)   # unaligned query ends
+    min(m, x, ge, m + ee) > 0 || return false
+    rate = max(k / x, k / (m + go + ge), 1 / (m + ge), (k - 1) / (go + ge), 1 / (m + ee))
+    # Ties can change identity, coverage and coordinates under kernel tie rules.
+    deficit = m * la - score
+    deficit < 0 && return true
+    need = nunique - floor(Int, rate * deficit)
+    need > 0 || return false
+    width = fld(deficit, ge)
+    n = length(diags); j = 1
+    for i in 1:n
+        j = max(j, i)
+        while j < n && diags[j+1] - diags[i] <= width
+            j += 1
+        end
+        j - i + 1 >= need || continue
+        # `d` is the lowest seed diagonal of a possible equal or better alignment
+        d = diags[i]
+        kwlo <= d - width && d + width <= kwhi || return false
+        lo == 1 || d - width + 1 >= lo || return false
+        hi == lb || d + width + la <= hi || return false
+    end
+    true
+end
+
 # Fitting (`:query` mode) of query `a` into target `b`, in a window of the
 # target around the seed diagonal. The result is recomputed on the whole target
 # without band if the path touches the band edge or a window boundary inside
-# the target. Coordinates refer to the whole target.
+# the target, or if an equal or better alignment elsewhere cannot be ruled out
+# (`_window_optimal`). Coordinates refer to the whole target.
 function _query_stats(st::_SearchState, si::Int, a::AbstractVector{UInt8}, b::AbstractVector{UInt8},
                       k::Int, s::_SearchSettings)
     la = length(a); lb = length(b)
@@ -359,7 +517,9 @@ function _query_stats(st::_SearchState, si::Int, a::AbstractVector{UInt8}, b::Ab
             if klo <= min(0, lw - la) && khi >= max(0, lw - la)
                 r = _align(st.ws, a, w, klo, khi, s.scoring)
                 inside = r.aend > 0 && (lo == 1 || r.bstart > 1) && (hi == lb || r.bend < lw)
-                if inside && !r.touches_band_edge
+                if inside && !r.touches_band_edge &&
+                   _window_optimal(st.diags, length(st.qkp[si]), r.score, la, lb, lo, hi,
+                                   klo + lo - 1, khi + lo - 1, k, s.scoring)
                     return _AlignStats(r.score, r.matches, r.mismatches, r.columns,
                                        r.terminal_gap_columns, r.gap_openings,
                                        r.internal_gap_openings, false,
@@ -375,13 +535,7 @@ function _target_stats(st::_SearchState, si::Int, a, b, k::Int, s::_SearchSettin
     if s.mode === :query
         _query_stats(st, si, a, b, k, s)
     else
-        la = length(a); lb = length(b)
-        klo, khi = _band(la, lb, s)
-        r = _align(st.ws, a, b, klo, khi, s.scoring)
-        if r.touches_band_edge && _identity(r, la, lb, s.iddef) >= s.id_threshold
-            r = _align(st.ws, a, b, -la, lb, s.scoring)
-        end
-        r
+        _global_stats(st.ws, a, b, s)
     end
 end
 
@@ -401,7 +555,7 @@ function _search_query(st::_SearchState, q::Int, query::Vector{UInt8}, db::Seque
     # The candidates are ordered in blocks (partial sort): usually only the
     # first few hundred are aligned before `maxaccepts`/`maxrejects` stop the
     # search, out of up to all references. The order is the full sort order.
-    n = length(cands); lo = 1; done = false
+    n = length(cands); lo = 1; done = false; stop = :exhausted
     while lo <= n && !done
         hi = min(n, lo + 255)
         partialsort!(view(cands, lo:n), 1:(hi - lo + 1))
@@ -421,15 +575,17 @@ function _search_query(st::_SearchState, q::Int, query::Vector{UInt8}, db::Seque
                                            s.cigar ? _cigar(st.ws.ops, r, la) : ""))
             end
             if ok
-                s.maxaccepts > 0 && length(accepted) >= s.maxaccepts && (done = true; break)
+                s.maxaccepts > 0 && length(accepted) >= s.maxaccepts && (done = true; stop = :maxaccepts; break)
             else
                 rejected += 1
-                s.maxrejects > 0 && rejected >= s.maxrejects && (done = true; break)
+                s.maxrejects > 0 && rejected >= s.maxrejects && (done = true; stop = :maxrejects; break)
             end
         end
         lo = hi + 1
     end
-    _finish!(accepted, s)
+    report = _report(n, length(accepted) + rejected, length(accepted), rejected, stop,
+                     nsequences(db) * length(strands))
+    _finish!(accepted, s), report
 end
 
 # K-mers in more than this many targets are not counted: a fraction of the
@@ -479,7 +635,8 @@ end
     search(queries, db::SequenceDB; mode = :query, strand = :both,
            min_identity = 80, iddef = 2, query_cov = 0.9, maxhits = 10,
            maxaccepts = 10, maxrejects = 32, minwordmatches = 12,
-           scoring = <mode default>, cigar = false, max_kmer_frequency = 1)
+           scoring = <mode default>, cigar = false, max_kmer_frequency = 1,
+           reports = nothing, threads = Threads.nthreads())
         -> Vector{Vector{Hit}}
 
 Search each query (strings or encoded vectors) against the database; element
@@ -497,7 +654,8 @@ decreasing identity.
   so a divergent end does not distort the coordinates of the rest. Only
   `iddef` 0 and 2 are allowed. The alignment is computed in a window
   of the target around the most frequent k-mer diagonal and recomputed on the
-  whole target if it reaches the window or band boundaries.
+  whole target if it reaches the window or band boundaries, or if the shared
+  k-mers do not rule out a better alignment elsewhere in the target.
 - `mode = :global`: end-to-end alignment as in [`search_self`](@ref).
 - `strand = :both` also searches the reverse complement of each query
   (`:plus`: forward only).
@@ -506,6 +664,8 @@ Candidate selection, acceptance (`min_identity`, `query_cov`), `maxaccepts`,
 `maxrejects`, `maxhits` and `iddef` are as in [`search_self`](@ref); `iddef =
 2` (default here) ignores the unaligned ends of the target. Candidates of both
 strands are ranked together. `cigar = true` adds the CIGAR string of each hit.
+`reports = SearchReport[]` is filled with one [`SearchReport`](@ref) per query.
+Queries run on `threads` tasks, as in [`search_self`](@ref).
 
 `max_kmer_frequency < 1` skips, when counting shared k-mers, the k-mers found
 in more than that fraction of the references and in more than 50,000 of
@@ -519,7 +679,9 @@ function search(queries::AbstractVector, db::SequenceDB; mode::Symbol = :query,
                 query_cov::Real = 0.9, maxhits::Integer = 10, maxaccepts::Integer = 10,
                 maxrejects::Integer = 32, minwordmatches::Integer = 12,
                 scoring::Scoring = _default_scoring(_check_mode(mode)), cigar::Bool = false,
-                max_kmer_frequency::Real = 1.0)
+                max_kmer_frequency::Real = 1.0,
+                reports::Union{Nothing,Vector{SearchReport}} = nothing,
+                threads::Integer = Threads.nthreads())
     _check_mode(mode)
     strand in (:both, :plus) || throw(ArgumentError("strand must be :both or :plus"))
     # Columns and gap openings that include end gaps depend on the target window
@@ -533,8 +695,10 @@ function search(queries::AbstractVector, db::SequenceDB; mode::Symbol = :query,
     encoded = [collect(encode(x)) for x in queries]
     n = length(encoded)
     results = Vector{Vector{Hit}}(undef, n)
-    _run_parallel(n, nsequences(db)) do state, q
-        results[q] = _search_query(state, q, encoded[q], db, strands, s)
+    _check_reports(reports, n)
+    _run_parallel(n, nsequences(db), Int(threads)) do state, q
+        results[q], report = _search_query(state, q, encoded[q], db, strands, s)
+        reports === nothing || (reports[q] = report)
     end
     results
 end

@@ -83,16 +83,17 @@ mutable struct _Workspace
     ops::Vector{UInt8}
     arev::Vector{UInt8}   # `a` reversed, with a sentinel at each end
     bpad::Vector{UInt8}   # `b` with a sentinel at each end
+    outside_bound::Int    # upper bound for global paths that leave the band
 end
 
-_Workspace() = _Workspace(_Buffers{Int16}(), _Buffers{Int32}(), UInt8[], UInt8[], UInt8[], UInt8[])
+_Workspace() = _Workspace(_Buffers{Int16}(), _Buffers{Int32}(), UInt8[], UInt8[], UInt8[], UInt8[], typemin(Int))
 
 # Int16 if no score (including the "minus infinity" sentinel minus a few
 # penalties) can leave the Int16 range.
 function _score_type(la::Int, lb::Int, sc::_Scoring)
     maxpen = max(abs(sc.mismatch), abs(sc.match), sc.gap_open + sc.gap_extend,
                  sc.a_end_open + sc.a_end_extend, sc.b_end_open + sc.b_end_extend)
-    worst = abs(sc.mismatch) * min(la, lb) + sc.match * min(la, lb) +
+    worst = abs(sc.mismatch) * min(la, lb) + abs(sc.match) * min(la, lb) +
             (sc.gap_open + max(sc.a_end_open, sc.b_end_open)) +
             max(sc.gap_extend, sc.a_end_extend, sc.b_end_extend) * (la + lb)
     _clipping(sc) && (worst += 2 * (sc.clip_open + sc.clip_extend * la);
@@ -156,6 +157,8 @@ function _fill!(ws::_Workspace, buf::_Buffers{T}, a::AbstractVector{UInt8},
     co = T(max(sc.clip_open, 0)); ce = T(max(sc.clip_extend, 0)); clip_oe = co + ce
     H, E, F, G, H1, E1, F1, G1, H2 = buf.H, buf.E, buf.F, buf.G, buf.H1, buf.E1, buf.F1,
                                      buf.G1, buf.H2
+    outside_bound = typemin(Int)
+    reward = max(Int(sc.match), Int(sc.mismatch), 0)
     @inbounds for d in 0:(la + lb)
         # Rotate: d-1 becomes "previous", d-2 "before previous".
         H, H1, H2 = H2, H, H1
@@ -224,7 +227,29 @@ function _fill!(ws::_Workspace, buf::_Buffers{T}, a::AbstractVector{UInt8},
         mhi > mlo && _boundary_cell!(H, E, F, G, H1, E1, F1, G1, H2, trace, arev, bpad, d, kb,
                                       mhi, s, la, lb, abase, bbase, tbase, neg, sc, Val(C), co,
                                       ce)
+        if !C
+            # Every path outside the band has a first exiting gap step. Its
+            # prefix is bounded by these DP states; the remaining substitutions
+            # can earn at most `reward` per pair, and gaps never add points.
+            for m in (mlo, mhi)
+                k = kb + 2m
+                i = (d - k) >> 1; j = (d + k) >> 1; x = m + 2
+                if k == klo && i < la
+                    op = j == 0 || j == lb ? sc.b_end_open : sc.gap_open
+                    ex = j == 0 || j == lb ? sc.b_end_extend : sc.gap_extend
+                    exit = max(Int(H[x]) - op - ex, Int(F[x]) - ex)
+                    outside_bound = max(outside_bound, exit + reward * min(la - i - 1, lb - j))
+                end
+                if k == khi && j < lb
+                    op = i == 0 || i == la ? sc.a_end_open : sc.gap_open
+                    ex = i == 0 || i == la ? sc.a_end_extend : sc.gap_extend
+                    exit = max(Int(H[x]) - op - ex, Int(E[x]) - ex)
+                    outside_bound = max(outside_bound, exit + reward * min(la - i, lb - j - 1))
+                end
+            end
+        end
     end
+    ws.outside_bound = outside_bound
     # After the last rotation H holds anti-diagonal la + lb.
     Int(H[((lb - la - _kbase(la + lb, klo)) >> 1) + 2])
 end

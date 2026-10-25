@@ -20,9 +20,9 @@ module NucleotideSearch
 
 import FASTX
 
-export Scoring, SequenceDB, Hit, PairAlignment
+export Scoring, SequenceDB, Hit, PairAlignment, SearchReport
 export encode, reverse_complement, align, search, search_self, save_db, load_db
-export nsequences
+export nsequences, sequence_ids, sequence_length
 
 include("encoding.jl")
 include("kernel.jl")

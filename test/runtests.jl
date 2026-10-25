@@ -393,6 +393,29 @@ end
     end
 end
 
+@testset "search: better copy away from the seed window" begin
+    # The copy with mismatches has the most seeds on one diagonal; the copy
+    # with two single-base indels scores more.
+    rng = MersenneTwister(41)
+    q = String(rand(rng, collect("ACGT"), 300))
+    a = collect(q)
+    for i in 15:15:300
+        a[i] = first(filter(!=(a[i]), collect("ACGT")))
+    end
+    best = q[1:100] * "A" * q[101:200] * "C" * q[201:end]
+    t = String(rand(rng, collect("ACGT"), 150)) * String(a) *
+        String(rand(rng, collect("ACGT"), 500)) * best * String(rand(rng, collect("ACGT"), 150))
+    full = align(q, t; mode = :query)
+    @test full.score == 556
+    for kw in ((;), (minwordmatches = 0, maxrejects = 0))
+        h = only(search(q, SequenceDB(["r"], [t]); strand = :plus, min_identity = 80,
+                        query_cov = 0.9, cigar = true, kw...))
+        @test h.score == full.score
+        @test (h.target_start, h.target_end) == (full.target_start, full.target_end) == (951, 1252)
+        @test h.cigar == full.cigar
+    end
+end
+
 @testset "search_self" begin
     rng = MersenneTwister(5)
     base = randseq(rng, 300)
@@ -415,4 +438,259 @@ end
     @test_logs (:warn, r"percentage") search_self(db; min_identity = 0.9)
 end
 
+@testset "search_self: overhangs and asymmetric end gaps" begin
+    # iddef 2 ignores end gaps: a shifted overlap of 80 identical bases is a hit
+    # whatever the identity threshold
+    rng = MersenneTwister(91)
+    q = String(rand(rng, collect("ACGT"), 100))
+    t = q[21:end] * String(rand(rng, collect("ACGT"), 20))
+    for kw in ((;), (minwordmatches = 0, maxrejects = 0))
+        res = search_self(SequenceDB(["q", "t"], [q, t]); min_identity = 99, iddef = 2,
+                          query_cov = 0.7, kw...)
+        @test only(res[1]).identity == only(res[2]).identity == 100.0
+        @test only(res[1]).score == align(q, t).score
+        @test (only(res[1]).query_start, only(res[1]).target_end) == (21, 80)
+    end
+    # Different end gap penalties for query and target: each direction is
+    # aligned on its own
+    q = "ACGTGACCTAGTACCGATGC"
+    t = q * "TTTTTTTTTT"
+    sc = Scoring(query_end_gap_open = 0, query_end_gap_extend = 0,
+                 target_end_gap_open = 20, target_end_gap_extend = 3)
+    res = search_self(SequenceDB(["q", "t"], [q, t]); scoring = sc, iddef = 2,
+                      min_identity = 0, query_cov = 0, minwordmatches = 0, maxrejects = 0)
+    @test only(res[1]).score == align(q, t; scoring = sc).score == 40
+    @test only(res[2]).score == align(t, q; scoring = sc).score == -4
+end
+
+@testset "search reports and accessors" begin
+    rng = MersenneTwister(17)
+    refs = [String(rand(rng, collect("ACGT"), 300)) for _ in 1:40]
+    db = SequenceDB(["r$i" for i in 1:40], refs)
+    @test sequence_ids(db) == ["r$i" for i in 1:40]
+    @test sequence_length(db, 3) == 300
+    @test_throws BoundsError sequence_length(db, 41)
+    queries = [refs[5][51:250], String(rand(rng, collect("ACGT"), 200))]
+    # Default limits: the first query stops at maxaccepts = 1, the second
+    # (unrelated) runs out of candidates
+    reports = SearchReport[]
+    res = search(queries, db; maxaccepts = 1, reports)
+    @test length(reports) == 2
+    @test reports[1].stop === :maxaccepts && reports[1].accepted == 1 && !reports[1].exhaustive
+    @test sequence_ids(db)[only(res[1]).target] == "r5"
+    @test reports[2].stop === :exhausted && reports[2].accepted == 0
+    @test reports[2].examined == reports[2].candidates
+    @test !reports[2].exhaustive          # the k-mer filter dropped most targets
+    # Every target and strand examined: exhaustive, and the same best hit
+    full = search(queries, db; maxaccepts = 0, maxrejects = 0, minwordmatches = 0, reports)
+    @test all(r -> r.exhaustive && r.examined == 80 && r.stop === :exhausted, reports)
+    @test only(full[1]).target == only(res[1]).target
+    # maxrejects ends the search of an unrelated query
+    search(queries[2:2], db; minwordmatches = 0, maxrejects = 5, reports)
+    @test only(reports).stop === :maxrejects && only(reports).rejected == 5
+    # search_self: the query itself is not a candidate
+    self_reports = SearchReport[]
+    search_self(db; minwordmatches = 0, maxrejects = 0, reports = self_reports)
+    @test all(r -> r.candidates == 39 && r.exhaustive, self_reports)
+    # Without `reports` the results are the same
+    @test search(queries, db; maxaccepts = 1) == res
+end
+
+@testset "search reports: limits on the last candidate" begin
+    # Coverage is independent of why the search stopped, for both limits,
+    # strand counts and execution modes. Truncating hits does not affect it.
+    for threads in (1, 2), strand in (:plus, :both), accepted in (true, false)
+        query = accepted ? "ACGTACGT" : "AAAAAAAA"
+        target = accepted ? query : "CCCCCCCC"
+        limit = strand === :both ? 2 : 1
+        limits = accepted ? (; maxaccepts = limit, maxrejects = 0) :
+                            (; maxaccepts = 0, maxrejects = limit)
+        reports = SearchReport[]
+        for n in (1, 2)
+            refs = SequenceDB(["r$i" for i in 1:n], fill(target, n); k = 3)
+            hits = search([query, query], refs; strand, min_identity = 100,
+                          minwordmatches = 0, maxhits = 1, reports, threads, limits...)
+            @test all(r -> r.stop === (accepted ? :maxaccepts : :maxrejects), reports)
+            @test all(r -> r.examined == limit && r.candidates == n * limit, reports)
+            @test all(r -> r.exhaustive == (n == 1), reports)
+            @test all(h -> length(h) == Int(accepted), hits)
+        end
+    end
+    for threads in (1, 2), accepted in (true, false)
+        seqs = accepted ? ["ACGTACGT", "ACGTACGT"] : ["AAAAAAAA", "CCCCCCCC"]
+        db = SequenceDB(["a", "b"], seqs; k = 3)
+        reports = SearchReport[]
+        limits = accepted ? (; maxaccepts = 1, maxrejects = 0) :
+                            (; maxaccepts = 0, maxrejects = 1)
+        search_self(db; min_identity = 100, minwordmatches = 0, reports, threads, limits...)
+        @test all(r -> r.stop === (accepted ? :maxaccepts : :maxrejects), reports)
+        @test all(r -> r.examined == r.candidates == 1 && r.exhaustive, reports)
+    end
+end
+
+@testset "global bands certify the unrestricted optimum" begin
+    ns = NucleotideSearch
+    q = "CCGTCGAGGCACGTCGATGCACGTCGATGGACGTCGATGCACGTCCATGCTCGTCGTTGCACGTCGATGCACGTCGATGCACGTCGACGCACGTCGTTGC"
+    t = "ACGTCGATGCCCGTCGAGGCACGTCGATGCACGTCGATGGACGTCGATGCACGTCCATGCTCGTCGTTGCACGTCGATGCACGTCGATGCACGTCGACGC"
+    @test align(q, t).score == 156
+    for threads in (1, 4), threshold in (82, 84)
+        reports = SearchReport[]
+        hits = search(fill(q, 4), SequenceDB(["t"], [t]); mode = :global,
+                      strand = :plus, iddef = 1, min_identity = threshold, reports, threads)
+        @test all(isempty, hits)
+        @test all(r -> r.exhaustive, reports)
+        @test all(isempty, search_self(SequenceDB(["q", "t"], [q, t]);
+                                      min_identity = threshold, threads))
+    end
+    rng = MersenneTwister(4473)
+    for trial in 1:500
+        a = rand(rng, UInt8(0):UInt8(4), rand(rng, 3:35))
+        b = rand(rng, UInt8(0):UInt8(4), rand(rng, 3:35))
+        sc = Scoring(match = rand(rng, (-3, 1, 2, 4)), mismatch = rand(rng, (-12, -4, 1)),
+                     gap_open = rand(rng, (0, 2, 20)), gap_extend = rand(rng, (0, 1, 3)),
+                     query_end_gap_open = rand(rng, (0, 2, 20)),
+                     query_end_gap_extend = rand(rng, (0, 1, 3)),
+                     target_end_gap_open = rand(rng, (0, 2, 20)),
+                     target_end_gap_extend = rand(rng, (0, 1, 3)))
+        s = ns._settings(:global, rand(rng, (50, 84, 95, 100)), rand(rng, 0:4),
+                         rand(rng, (0.0, 0.7, 0.9, 1.0)), 0, 0, 0, 0, sc, false)
+        got = ns._global_stats(_Workspace(), a, b, s)
+        full = _align(_Workspace(), a, b, -length(a), length(b), s.scoring)
+        @test (got.score, got.matches, got.mismatches, got.columns, got.gap_openings,
+               got.astart, got.aend, got.bstart, got.bend) ==
+              (full.score, full.matches, full.mismatches, full.columns, full.gap_openings,
+               full.astart, full.aend, full.bstart, full.bend)
+    end
+    # Perfect matches can be certified without allocating the full trace.
+    a = encode(repeat("ACGT", 100))
+    s = ns._settings(:global, 100, 1, 0.9, 0, 0, 0, 0, Scoring(), false)
+    ws = _Workspace()
+    @test ns._global_stats(ws, a, a, s).score == 800
+    @test length(ws.trace) < length(a)^2
+end
+
+@testset "negative match scores use a safe score width" begin
+    sc = Scoring(match = -999, mismatch = -1, gap_open = 0, gap_extend = 400,
+                 terminal_gap_open = 0, terminal_gap_extend = 400)
+    a = encode(repeat("A", 50))
+    ks = _kernel_scoring(sc, :global)
+    @test NucleotideSearch._score_type(50, 50, ks) === Int32
+    @test align(a, a; scoring = sc).score == reference_score(a, a, ks) == -40_000
+end
+
+@testset "parallel failures join all workers" begin
+    entered = Channel{Nothing}(1); release = Channel{Nothing}(1)
+    failed = Channel{Nothing}(1); finished = Channel{Nothing}(1)
+    parent = Threads.@spawn try
+        NucleotideSearch._run_parallel(2, 0, 2) do _, q
+            if q == 1
+                take!(entered)
+                put!(failed, nothing)
+                error("injected worker failure")
+            else
+                put!(entered, nothing)
+                take!(release)
+                put!(finished, nothing)
+            end
+        end
+        nothing
+    catch e
+        e
+    end
+    try
+        @test timedwait(() -> isready(failed), 10) == :ok
+        @test timedwait(() -> istaskdone(parent), 0.1) == :timed_out
+    finally
+        put!(release, nothing)
+    end
+    @test timedwait(() -> istaskdone(parent), 10) == :ok
+    @test fetch(parent) isa TaskFailedException
+    @test isready(finished)
+end
+
+@testset "reciprocal cache has a fixed entry budget" begin
+    ns = NucleotideSearch
+    sample = _align(_Workspace(), encode("ACGT"), encode("ACGT"), -4, 4,
+                    _kernel_scoring(Scoring(), :global))
+    for budget in (0, 1, 7, 20)
+        cache = ns._PairCache(4; max_entries = budget)
+        for key in 1:100
+            @test ns._get_or_align!(() -> sample, cache, key) === sample
+            @test sum(length, cache.tables) <= budget
+        end
+        @test sum(length, cache.tables) == budget
+    end
+    cache = ns._PairCache(4; max_entries = 7)
+    Threads.@threads for key in 1:1_000
+        ns._get_or_align!(() -> sample, cache, key)
+    end
+    @test sum(length, cache.tables) <= 7
+    cache = ns._PairCache(1; max_entries = 1)
+    calls = Ref(0)
+    compute() = (calls[] += 1; sample)
+    ns._get_or_align!(compute, cache, 1)
+    ns._get_or_align!(compute, cache, 1)
+    @test calls[] == 1
+    @test isempty(only(cache.tables))
+    rng = MersenneTwister(19)
+    base = randseq(rng, 80)
+    db = SequenceDB(["s$i" for i in 1:15], [mutate(rng, base, 0.05) for _ in 1:15])
+    expected = search_self(db; cache_entries = 0, threads = 1, maxhits = 0)
+    for budget in (0, 1, 10), threads in (1, 4)
+        @test search_self(db; cache_entries = budget, threads, maxhits = 0) == expected
+    end
+    @test_throws ArgumentError search_self(db; cache_entries = -1)
+end
+
+@testset "threads: serial and parallel give the same results" begin
+    rng = MersenneTwister(23)
+    base = String(rand(rng, collect("ACGT"), 400))
+    seqs = [join(rand(rng) < 0.03 ? rand(rng, setdiff("ACGT", c)) : c for c in base) for _ in 1:60]
+    db = SequenceDB(["s$i" for i in 1:60], seqs)
+    ref = search_self(db; maxhits = 0)
+    for t in (1, 2, 7, 100)
+        @test search_self(db; maxhits = 0, threads = t) == ref
+        @test search(seqs[1:10], db; threads = t) == search(seqs[1:10], db)
+    end
+    @test search(String[], db; threads = 1) == Vector{Hit}[]
+    @test_throws ArgumentError search(seqs[1:2], db; threads = 0)
+end
+
+end
+
+@testset "Query windows preserve full-kernel tie rules" begin
+    q = "ACATAATCAAAGCAGGCGGGTTTCCCGAACTTAGACCACGTCGCCTATGATTGCT"
+    target = "T"^60 * "ACATAATCAAAGCAGCCGGGTTTTCCGAACTTAGACCACGTCGCATATGGTTGCT" *
+             "C"^120 * "ACATAATCAAAGCGAGGCGGGTTTTCCCGAGACCTTAAGTACCACGTTCTGCCTATGATTGCT" * "A"^60
+    scoring = Scoring(match=2, mismatch=0, gap_open=0, gap_extend=1,
+                      terminal_gap_open=20, terminal_gap_extend=1)
+    db = SequenceDB(["ref"], [target]; k=3)
+    full = NucleotideSearch.align(q, target; mode=:query, scoring)
+    @test full.score == 102
+    @test full.matches == 55
+    expected_identity = 100 * 55 / 63
+    for threads in (1, 4), threshold in (0, 50, 85, 87, 88, 90, 92)
+        hits = search(q, db; strand=:plus, minwordmatches=0, min_identity=threshold,
+                      query_cov=0, maxaccepts=0, maxrejects=0, cigar=true, threads, scoring)
+        if threshold > expected_identity
+            @test isempty(hits)
+        else
+            @test length(hits) == 1
+            hit = only(hits)
+            @test hit.identity ≈ expected_identity
+            @test (hit.score, hit.matches, hit.mismatches) == (full.score, full.matches, full.mismatches)
+            @test (hit.target_start, hit.target_end, hit.cigar) ==
+                  (full.target_start, full.target_end, full.cigar)
+        end
+    end
+    # Even a perfect match outside the seed window can win the kernel's tie.
+    repeated = q * "C"^120 * q
+    repeated_db = SequenceDB(["ref"], [repeated]; k=3)
+    for sc in (Scoring(), scoring)
+        expected = NucleotideSearch.align(q, repeated; mode=:query, scoring=sc)
+        hit = only(search(q, repeated_db; strand=:plus, min_identity=100, query_cov=1,
+                          minwordmatches=0, maxaccepts=0, maxrejects=0, cigar=true, scoring=sc))
+        @test (hit.score, hit.target_start, hit.target_end, hit.cigar) ==
+              (expected.score, expected.target_start, expected.target_end, expected.cigar)
+    end
 end

@@ -72,6 +72,23 @@ the first `maxhits` hits by decreasing identity are returned.
 | `query_cov` | 0.9 | 0.9 |
 | `maxhits` / `maxaccepts` / `maxrejects` | 10 / 10 / 32 | 10 / 0 / 32 |
 | `minwordmatches` | 12 | 12 |
+| `threads` (tasks; `1` = serial, on the calling task) | `Threads.nthreads()` | `Threads.nthreads()` |
+
+The hits are the best among the candidates examined. To see how far a search
+went, pass `reports = SearchReport[]`: one `SearchReport` per query with the
+number of candidates, how many were examined, accepted and rejected, why the
+search stopped (`:maxaccepts`, `:maxrejects` or `:exhausted`) and whether it
+was `exhaustive` (every target and strand examined). The alignment of each
+hit is optimal for its pair in either case. `sequence_ids(db)` and
+`sequence_length(db, i)` give the identifier and length of target `i`.
+
+Global searches certify the banded result with an upper bound on paths
+leaving the band; if an outside path could tie or improve its score, the
+pair is recomputed without band before applying the filters.
+`search_self(...; cache_entries = 100_000)` bounds the reciprocal alignment
+cache (0 disables it). Pairs that do not fit are recomputed in the same
+canonical orientation, so the budget does not change the results. Failed
+parallel searches wait for all workers before reporting the error.
 
 Identity definitions (`iddef`, as in VSEARCH): `0` matches / shorter length;
 `1`, `4` matches / alignment columns; `2` matches / columns excluding end
@@ -94,7 +111,12 @@ the window).
 In `:query` mode each candidate is aligned in a window of the reference
 around the most frequent k-mer diagonal, with a band wide enough for
 `min_identity`. If the alignment reaches a window or band boundary inside the
-reference, it is recomputed on the whole reference without band.
+reference, it is recomputed on the whole reference without band. It is also
+recomputed unless the k-mers shared with the reference prove that no equal or
+better alignment lies outside the window (q-gram lemma: such an alignment
+would keep enough of the query's unique k-mers on nearby diagonals). Ties
+use the full kernel's rules too: equal scores can have different identities,
+coverage and coordinates, so they must not change when `min_identity` changes.
 
 Coordinates are 1-based and inclusive and refer to the first and last bases
 in an aligned pair; query coordinates refer to the query as given, also on
@@ -135,16 +157,19 @@ Notes:
 ## Validation
 
 - `test/runtests.jl` (`julia -t 4 --project=. -e 'using Pkg; Pkg.test()'`,
-  about 3,300 tests, 20 s): the kernel against a full-matrix reference
+  about 4,800 tests): the kernel against a full-matrix reference
   dynamic programming with random scores, end-gap penalties, soft clipping
   and both score widths, including the score of the traced path;
   coordinates and CIGAR strings on
   synthetic references with mutated query ends, indels, both strands and
   truncated references; windowed search against unbanded alignment;
   database save/load; `search_self`.
-- `build_matchlist` of LULU.jl, now built on `search_self`, gives match lists
-  identical bit for bit to its previous implementation (example data of the
-  R package `lulu`, 2,425 OTUs, nine settings) at the same speed.
+- Nine LULU match-list settings on 2,425 OTUs were checked after adding the
+  global-band certificate. Six are unchanged byte for byte. The default and
+  word-length-6 settings replace one suboptimal hit; the 90% identity setting
+  removes two. Full unbanded alignment confirms that the removed hits have
+  identities below their thresholds. The certificate is also checked against
+  full alignment on 500 random pairs with varied scoring and end penalties.
 - Comparison with BLAST+ 2.17.0 on 303 rbcL ASVs (331 bp) against 5,417
   Diat.barcode references (225–2,874 bp), best BLAST hit of each ASV:
 

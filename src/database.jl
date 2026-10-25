@@ -19,6 +19,20 @@ end
 
 nsequences(db::SequenceDB) = length(db.ids)
 Base.length(db::SequenceDB) = nsequences(db)
+
+"""
+    sequence_ids(db::SequenceDB) -> Vector{String}
+    sequence_length(db::SequenceDB, i) -> Int
+
+Identifiers of the sequences of `db` (as read from the FASTA headers or
+given to the constructor), and the length of sequence `i`. `Hit.target` is
+an index into these.
+"""
+sequence_ids(db::SequenceDB) = db.ids
+function sequence_length(db::SequenceDB, i::Integer)
+    1 <= i <= nsequences(db) || throw(BoundsError(db, i))
+    _seqlen(db, i)
+end
 _seq(db::SequenceDB, s::Integer) = view(db.data, db.starts[s]:(db.starts[s+1] - 1))
 _seqlen(db::SequenceDB, s::Integer) = db.starts[s+1] - db.starts[s]
 
