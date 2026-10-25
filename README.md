@@ -5,6 +5,10 @@ ASVs, OTUs), against each other or against a reference database. No external
 programs (BLAST, VSEARCH); the only dependency is FASTX.jl, used to read FASTA
 files.
 
+This package is part of an experimental effort to use AI to port
+bioinformatics and quantitative ecology packages to Julia, with the goal of
+creating a unified environment for high performance scientific computing.
+
 - **`search`** fits each query into reference sequences (`:query` mode, the
   default). The whole query is aligned, and gaps at its ends (unaligned
   reference bases) are free, so the hit gives **exact start and end
@@ -13,7 +17,7 @@ files.
   Both strands are searched.
 - **`search_self`** searches every sequence against all the others with a
   global alignment, the strategy of `vsearch --usearch_global --self`. It is
-  the engine of `build_matchlist` in [LULU.jl](../LULU.jl).
+  the engine of `build_matchlist` in [LULU.jl](https://github.com/alexology/LULU.jl).
 - **`SequenceDB`** holds encoded sequences and an inverted k-mer index;
   `save_db`/`load_db` store it in a binary file.
 - **`align`** computes one optimal alignment (no band), with coordinates and
@@ -23,8 +27,18 @@ The kernel is a banded affine-gap (Gotoh) dynamic programming filled by
 anti-diagonals, vectorised (SIMD) with 16-bit scores (32-bit when needed).
 Queries run on all threads; results do not depend on the number of threads.
 
-Julia ≥ 1.10. License: MIT. Used by [LULU.jl](../LULU.jl) and
-[ASVCoordinates.jl](../ASVCoordinates.jl).
+Julia ≥ 1.10. License: MIT. Used by [LULU.jl](https://github.com/alexology/LULU.jl) and
+[ASVCoordinates.jl](https://github.com/alexology/ASVCoordinates.jl).
+
+## Install from GitHub
+
+This package is not registered in the Julia General registry. Install it
+from GitHub:
+
+```julia
+using Pkg
+Pkg.add(url="https://github.com/alexology/NucleotideSearch.jl")
+```
 
 ## Installation
 
