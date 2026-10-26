@@ -347,12 +347,19 @@ end
 @testset "search: frequent k-mers are not counted" begin
     # A 40-base block shared by all targets; target 3 also shares the query's
     # unique part. With the cap, only the unique part counts.
-    rng = MersenneTwister(8)
-    block = randseq(rng, 40)
-    uniq = randseq(rng, 60)
-    targets = [vcat(block, randseq(rng, 60)), vcat(block, randseq(rng, 60)), vcat(block, uniq)]
+    # Fixed sequences avoid accidental shared k-mers when Julia's RNG changes.
+    block = encode("TTGAGCTCACTTGCCCGTCTCTAAGCATACCCCCGAGGAT")
+    uniq = encode("TCTCTTCGCTGGCAAATAGCCGGCCACGCATGAATTGCAATGTAGCGCCGCTCGCTTGAG")
+    tails = encode.(["ATAACTGTGCGTAATTTGTCGGCATAATATCTAAGTTGAAAACTTCTTTACGCGTTAAGT",
+                     "GCTGAATAGGACTAAGACCCGCAGCGTGTGTAGGGCCCTGGGACGCCTCGTTCCCATTTA"])
+    targets = [vcat(block, tails[1]), vcat(block, tails[2]), vcat(block, uniq)]
     db = SequenceDB(["t1", "t2", "t3"], targets)
     q = vcat(block, uniq)
+    block_kmers = Set(NucleotideSearch._unique_kmers(block, 8))
+    query_kmers = Set(NucleotideSearch._unique_kmers(q, 8))
+    for target in targets[1:2]
+        @test intersect(query_kmers, Set(NucleotideSearch._unique_kmers(target, 8))) == block_kmers
+    end
     st = NucleotideSearch._SearchState(3)
     count_cands(maxp, mww) = begin
         s = NucleotideSearch._settings(:query, 80, 2, 0.5, 0, 10, 32, mww,
