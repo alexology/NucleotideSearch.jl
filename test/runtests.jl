@@ -250,6 +250,54 @@ end
     @test_throws ArgumentError Scoring(gap_open = -1)
 end
 
+@testset "database: reject corrupt storage before search" begin
+    mktempdir() do dir
+        path = joinpath(dir, "index.nsdb")
+        valid = SequenceDB(["a", "b", "c"], ["AAAAAA", "AAAAAA", "CCCCCC"]; k = 3)
+        for damage in (db -> (db.starts[1] = 0),
+                       db -> (db.starts[2] = db.starts[3] + 1),
+                       db -> (db.starts[end] += 1),
+                       db -> (db.offsets[1] = 1),
+                       db -> (db.offsets[2] = -1),
+                       db -> (db.offsets[end] += 1),
+                       db -> (db.postings[1] = 0),
+                       db -> (db.postings[1] = 4),
+                       db -> (db.postings[1] = db.postings[2]),
+                       db -> reverse!(view(db.postings, 1:2)),
+                       db -> (db.data[1] = 0xff),
+                       db -> pop!(db.starts),
+                       db -> pop!(db.offsets))
+            damaged = deepcopy(valid)
+            damage(damaged)
+            save_db(path, damaged)
+            @test_throws ArgumentError load_db(path)
+        end
+        save_db(path, valid)
+        bytes = read(path)
+        for nbytes in (0, 4, 7, 15, 23, length(bytes) - 1)
+            write(path, bytes[1:nbytes])
+            @test_throws ArgumentError load_db(path)
+        end
+        for (position, value) in ((8, Int64(0)), (8, Int64(13)), (16, Int64(-1)),
+                                  (16, typemax(Int64)), (24, Int64(-1)), (24, typemax(Int64)))
+            write(path, bytes)
+            open(path, "r+") do io
+                seek(io, position)
+                write(io, htol(value))
+            end
+            @test_throws ArgumentError load_db(path)
+        end
+        write(path, [bytes; 0x00])
+        @test_throws ArgumentError load_db(path)
+        for db in (SequenceDB(String[], String[]; k = 3),
+                   SequenceDB(["a", "b", "c"], ["", "NNN", ""]; k = 3), valid)
+            save_db(path, db)
+            loaded = load_db(path)
+            @test all(getfield(db, f) == getfield(loaded, f) for f in fieldnames(SequenceDB))
+        end
+    end
+end
+
 @testset "database: build, save, load" begin
     db = SequenceDB(["a", "b", "c"], ["ACGTACGTAC", "TTTTGGGGCCCC", "ACGTNACGTA"]; k = 4)
     @test nsequences(db) == 3

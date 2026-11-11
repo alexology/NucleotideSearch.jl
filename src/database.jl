@@ -151,34 +151,66 @@ function _write_vec(io::IO, v::Vector{T}) where {T}
     ENDIAN_BOM == 0x04030201 ? write(io, v) : write(io, htol.(v))
 end
 
-function _read_vec(io::IO, ::Type{T}) where {T}
+function _read_count(io::IO, limit::Integer)
     n = ltoh(read(io, Int64))
-    0 <= n || throw(ArgumentError("corrupt database file"))
+    0 <= n <= limit || throw(ArgumentError("corrupt database file: invalid length"))
+    Int(n)
+end
+
+_remaining(io::IOStream) = filesize(io) - position(io)
+
+function _read_vec(io::IOStream, ::Type{T}; expected = nothing) where {T}
+    n = _read_count(io, max(0, _remaining(io) - sizeof(Int64)) ÷ sizeof(T))
+    expected === nothing || n == expected ||
+        throw(ArgumentError("corrupt database file: unexpected vector length"))
     v = read!(io, Vector{T}(undef, n))
     ENDIAN_BOM == 0x04030201 ? v : ltoh.(v)
+end
+
+function _validate_storage(data, starts, offsets, postings, n)
+    (first(starts) == 1 && last(starts) == length(data) + 1 && issorted(starts) &&
+     first(offsets) == 0 && last(offsets) == length(postings) && issorted(offsets) &&
+     all(<=(0x04), data) && all(p -> 1 <= p <= n, postings)) ||
+        throw(ArgumentError("corrupt database file: invalid sequence or index storage"))
+    for w in 2:length(offsets)
+        for p in (offsets[w - 1] + 2):offsets[w]
+            postings[p - 1] < postings[p] ||
+                throw(ArgumentError("corrupt database file: postings must be strictly increasing"))
+        end
+    end
+    nothing
 end
 
 """
     load_db(path) -> SequenceDB
 
-Read a database written by [`save_db`](@ref).
+Read a database written by [`save_db`](@ref). Invalid lengths, truncated files
+and inconsistent sequence/index storage raise an `ArgumentError`.
 """
 function load_db(path::AbstractString)
     open(path) do io
-        read(io, 4) == _MAGIC || throw(ArgumentError("$path is not a NucleotideSearch database"))
-        v = ltoh(read(io, UInt32))
-        v == _FORMAT_VERSION ||
-            throw(ArgumentError("$path: unsupported database format version $v"))
-        k = Int(ltoh(read(io, Int64))); n = Int(ltoh(read(io, Int64)))
-        ids = Vector{String}(undef, n)
-        for s in 1:n
-            ids[s] = String(read(io, Int(ltoh(read(io, Int64)))))
+        try
+            read(io, 4) == _MAGIC || throw(ArgumentError("$path is not a NucleotideSearch database"))
+            v = ltoh(read(io, UInt32))
+            v == _FORMAT_VERSION ||
+                throw(ArgumentError("$path: unsupported database format version $v"))
+            k = _check_k(ltoh(read(io, Int64)))
+            n = _read_count(io, min(typemax(Int32) - 1, max(0, _remaining(io) - sizeof(Int64)) ÷ sizeof(Int64)))
+            ids = Vector{String}(undef, n)
+            for s in 1:n
+                bytes = _read_count(io, max(0, _remaining(io) - sizeof(Int64)))
+                ids[s] = String(read(io, bytes))
+            end
+            data = _read_vec(io, UInt8)
+            starts = _read_vec(io, Int; expected = n + 1)
+            offsets = _read_vec(io, Int; expected = (1 << (2k)) + 1)
+            postings = _read_vec(io, Int32)
+            eof(io) || throw(ArgumentError("corrupt database file: trailing bytes"))
+            _validate_storage(data, starts, offsets, postings, n)
+            SequenceDB(ids, data, starts, k, offsets, postings)
+        catch err
+            err isa EOFError || rethrow()
+            throw(ArgumentError("corrupt database file: truncated input"))
         end
-        data = _read_vec(io, UInt8); starts = _read_vec(io, Int)
-        offsets = _read_vec(io, Int); postings = _read_vec(io, Int32)
-        (length(starts) == n + 1 && length(offsets) == (1 << (2k)) + 1 &&
-         offsets[end] == length(postings) && starts[end] == length(data) + 1) ||
-            throw(ArgumentError("corrupt database file"))
-        SequenceDB(ids, data, starts, k, offsets, postings)
     end
 end
